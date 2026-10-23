@@ -1,0 +1,22 @@
+[Unit]
+Description=Reactive Resume
+Documentation=https://docs.rxresu.me
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=@APP_DIR@
+Environment=COMPOSE_PROJECT_NAME=reactive-resume
+ExecStart=/usr/bin/docker compose up --remove-orphans
+ExecStop=/usr/bin/docker compose down
+Restart=always
+RestartSec=10
+TimeoutStartSec=600
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

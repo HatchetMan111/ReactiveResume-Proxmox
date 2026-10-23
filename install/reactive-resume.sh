@@ -168,10 +168,36 @@ need_value() {
 }
 
 on_error() {
-  local rc=$?
+  local ec=$? line="$1" cmd="$2"
   trap - ERR
-  msg_error "FEHLER in ${BASH_SOURCE[0]}:${BASH_LINENO[0]} (rc=${rc}): ${BASH_COMMAND}"
-  exit "$rc"
+  msg_error "FEHLER: »${cmd}« in Zeile ${line} (Exit ${ec})."
+  msg_error "Host-Log: ${LOG_FILE}"
+  if [[ -n "${VMID:-}" ]]; then
+    if ct_exists "$VMID"; then
+      echo "--- pct status/config ---" >&2
+      pct status "$VMID" >&2 || true
+      pct config "$VMID" 2>&1 | sed -n '1,25p' >&2 || true
+      echo "--- Innen-Log (tail 120) ---" >&2
+      pct exec "$VMID" -- tail -n 120 /var/log/reactive-resume-install.log 2>&1 || true
+      echo "--- Dienststatus ---" >&2
+      pct exec "$VMID" -- systemctl status reactive-resume --no-pager -l 2>&1 | tail -n 80 >&2 || true
+      echo "--- Compose-Logs (tail 200) ---" >&2
+      pct exec "$VMID" -- bash -lc 'cd /opt/reactive-resume && docker compose logs --tail=200' 2>&1 || true
+      echo "Diagnose: pct enter ${VMID}" >&2
+    elif vm_exists "$VMID"; then
+      echo "--- qm status/config ---" >&2
+      qm status "$VMID" >&2 || true
+      qm config "$VMID" 2>&1 | sed -n '1,25p' >&2 || true
+      if [[ -n "${IP:-}" && ${#SSH_OPTS[@]} -gt 0 ]]; then
+        echo "--- Innen-Log (tail 120) ---" >&2
+        ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" 'sudo tail -n 120 /var/log/reactive-resume-install.log' 2>&1 || true
+        ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" 'sudo systemctl status reactive-resume --no-pager -l | tail -n 80' 2>&1 || true
+      fi
+      echo "Diagnose: qm terminal ${VMID}" >&2
+    fi
+  fi
+  msg_error "Erneut mit --debug für bash -x: bash reactive-resume.sh --debug"
+  exit "$ec"
 }
 
 parse_args() {
@@ -267,18 +293,238 @@ validate_config() {
   fi
 }
 
+setup_logging() {
+  umask 077
+  mkdir -p "$(dirname "$LOG_FILE")"
+  : > "$LOG_FILE"
+  chmod 600 "$LOG_FILE"
+  exec > >(tee -i "$LOG_FILE") 2>&1
+  trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
+  msg_info "Host-Log: ${LOG_FILE}"
+  if [[ "$DEBUG" == "1" ]]; then set -x; fi
+}
+
+cleanup() {
+  if [[ -n "$SSH_KEYS_TMP" && -f "$SSH_KEYS_TMP" ]]; then rm -f "$SSH_KEYS_TMP"; fi
+  if [[ -n "$INNER_TMP" && -f "$INNER_TMP" ]]; then rm -f "$INNER_TMP"; fi
+  return 0
+}
+
+wait_for_ct() {
+  local i
+  for i in $(seq 1 60); do
+    pct exec "$VMID" -- true >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
+}
+
+detect_ct_ip() {
+  local ip=""
+  ip="$(pct exec "$VMID" -- ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
+  [[ -n "$ip" ]] || ip="$(pct exec "$VMID" -- hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  printf '%s\n' "$ip"
+}
+
+wait_for_ip() {
+  local i ip
+  for i in $(seq 1 60); do
+    ip="$(detect_ct_ip)"
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      WAIT_IP="$ip"
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+is_ours_ct() {
+  pct config "$1" 2>/dev/null | grep -qE "(^hostname: ${CT_HOSTNAME}$|${APP})"
+}
+
+ensure_unique_name() {
+  local n
+  if [[ "$MODE" == "lxc" ]]; then
+    n="$(pct list 2>/dev/null | awk 'NR>1 {print $NF}' | grep -x "$CT_HOSTNAME" || true)"
+  else
+    n="$(qm list 2>/dev/null | awk 'NR>1 {print $2}' | grep -x "$CT_HOSTNAME" || true)"
+  fi
+  if [[ -n "$n" ]]; then
+    msg_warn "Name ${CT_HOSTNAME} ist vergeben – nutze ${CT_HOSTNAME}-${VMID}."
+    CT_HOSTNAME="${CT_HOSTNAME}-${VMID}"
+  fi
+}
+
+create_lxc() {
+  local tmpl net
+  local xtrace_on=0
+  [[ $- == *x* ]] && xtrace_on=1
+  tmpl="$(ensure_template)"
+  [[ -n "$STORAGE" ]] || STORAGE="$(pick_storage rootdir)" || die "Kein Storage für rootdir gefunden."
+  pvesm status --storage "$STORAGE" >/dev/null 2>&1 || die "Storage ${STORAGE} existiert nicht."
+  net="ip=dhcp"
+  [[ -n "$STATIC_IP" ]] && net="ip=${STATIC_IP},gw=${GATEWAY}"
+  msg_info "Erstelle LXC ${VMID} (${CT_HOSTNAME}) auf ${STORAGE} ..."
+  pct create "$VMID" "$tmpl" \
+    --hostname "$CT_HOSTNAME" \
+    --cores "$CORES" --memory "$RAM_MB" --swap 512 \
+    --rootfs "${STORAGE}:${DISK_GB}" \
+    --net0 "name=eth0,bridge=${BRIDGE},${net},firewall=0" \
+    --nameserver 1.1.1.1 \
+    --features nesting=1,keyctl=1 \
+    --unprivileged 1 --onboot 1 \
+    --description "${APP} – installiert von ${INSTALLER_REPO}"
+  pct start "$VMID"
+  wait_for_ct || die "Container ${VMID} bootet nicht (pct exec fehlgeschlagen)."
+  set +x
+  ROOT_PW="$(random_password)"
+  printf 'root:%s\n' "$ROOT_PW" | pct exec "$VMID" -- chpasswd \
+    || die "Root-Passwort konnte im Container nicht gesetzt werden."
+  {
+    echo "${APP} – Zugangsdaten"
+    echo "CTID: ${VMID}"
+    echo "Root-Passwort: ${ROOT_PW}"
+    echo "Konsole: pct enter ${VMID}"
+  } > /root/reactive-resume.creds
+  chmod 600 /root/reactive-resume.creds
+  ROOT_PW=""
+  if (( xtrace_on )); then set -x; fi
+  msg_ok "LXC erstellt. Root-Passwort: /root/reactive-resume.creds"
+}
+
+update_lxc() {
+  pct set "$VMID" --onboot 1 --features nesting=1,keyctl=1
+  if [[ "$(pct status "$VMID" | awk '{print $2}')" != "running" ]]; then
+    msg_info "Starte bestehenden LXC ${VMID} ..."
+    pct start "$VMID"
+  fi
+  wait_for_ct || die "Bestehender Container ${VMID} ist nicht erreichbar."
+}
+
+run_inner() {
+  local inner
+  local -a args
+  if [[ -f "${SCRIPT_DIR}/reactive-resume-inner.sh" ]]; then
+    inner="${SCRIPT_DIR}/reactive-resume-inner.sh"
+  else
+    INNER_TMP="$(mktemp)"
+    msg_info "Lade Innenscript aus ${RAW_BASE} ..."
+    curl -fsSL --retry 3 -o "$INNER_TMP" "${RAW_BASE}/install/reactive-resume-inner.sh"
+    inner="$INNER_TMP"
+  fi
+  [[ -s "$inner" ]] || die "Innenscript nicht gefunden."
+  args=(--port "$APP_PORT" --app-url "http://${IP}:${APP_PORT}" --app-image "$APP_IMAGE")
+  [[ "$DEBUG" == "1" ]] && args+=(--debug)
+
+  if [[ "$MODE" == "lxc" ]]; then
+    pct push "$VMID" "$inner" /tmp/reactive-resume-inner.sh --perms 700
+    if ! pct exec "$VMID" -- bash /tmp/reactive-resume-inner.sh "${args[@]}"; then
+      die "Innenscript ist fehlgeschlagen (siehe Diagnose oben)."
+    fi
+  else
+    scp "${SSH_OPTS[@]}" "$inner" "${CI_USER}@${IP}:/tmp/reactive-resume-inner.sh"
+    # shellcheck disable=SC2029 # args are shell-quoted here and expanded client-side by design
+    if ! ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" "sudo bash /tmp/reactive-resume-inner.sh $(printf '%q ' "${args[@]}")"; then
+      die "Innenscript ist fehlgeschlagen (siehe Diagnose oben)."
+    fi
+  fi
+}
+
+verify_outer() {
+  local i code
+  for ((i = 1; i <= 24; i++)); do
+    code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${IP}:${APP_PORT}/api/health" 2>/dev/null || true)"
+    if [[ "$code" == "200" ]]; then
+      msg_ok "Web-UI von außen erreichbar (HTTP 200)."
+      return 0
+    fi
+    sleep 5
+  done
+  msg_error "Web-UI von außen nicht erreichbar (letzter HTTP-Code: ${code:-000})."
+  return 1
+}
+
+summary() {
+  echo ""
+  echo "════════════ ${APP} BEREIT ════════════"
+  echo "  Typ         : $([[ "$MODE" == "lxc" ]] && echo LXC || echo VM)"
+  echo "  ID          : ${VMID}"
+  echo "  Hostname    : ${CT_HOSTNAME}"
+  echo "  Ressourcen  : ${CORES} vCPU / ${RAM_MB} MiB RAM / ${DISK_GB} GiB Disk"
+  echo "  IP          : ${IP}"
+  echo "  Web UI      : http://${IP}:${APP_PORT}/"
+  echo "  Health      : http://${IP}:${APP_PORT}/api/health"
+  if [[ "$MODE" == "lxc" ]]; then
+    echo "  Konsole     : pct enter ${VMID}"
+    echo "  Credentials : /root/reactive-resume.creds"
+  else
+    echo "  SSH         : ssh -i ${SSH_KEY_PATH} ${CI_USER}@${IP}"
+    echo "  Konsole     : qm terminal ${VMID}"
+  fi
+  echo "  Dienst      : systemctl status ${APP_ID}"
+  echo "  Update      : dieses Script mit --vmid ${VMID}$([[ "$MODE" == "vm" ]] && echo ' --vm') erneut ausführen"
+  echo "  Reboot-Test : bash tests/reboot-test.sh ${VMID} ${IP} ${APP_PORT}"
+  echo "  Entfernen   : $([[ "$MODE" == "lxc" ]] && echo "pct stop ${VMID}; pct destroy ${VMID}" || echo "qm stop ${VMID}; qm destroy ${VMID} --purge")"
+  echo "  OpenRouter  : Settings → AI & developer → Add provider → OpenRouter"
+  echo "═══════════════════════════════════════"
+}
+
+main() {
+  local exists=0
+  parse_args "$@"
+  validate_config
+  setup_logging
+  trap cleanup EXIT
+
+  if [[ -z "$VMID" ]]; then
+    VMID="$(next_free_id)"
+  fi
+  msg_info "Ziel-ID: ${VMID} (Modus: ${MODE})"
+
+  if ct_exists "$VMID"; then
+    [[ "$MODE" == "lxc" ]] || die "ID ${VMID} ist ein LXC; nutze ohne --vm."
+    if [[ "$FORCE" != "1" ]] && ! is_ours_ct "$VMID"; then
+      die "ID ${VMID} gehört nicht zu ${APP}. Mit --force überschreiben."
+    fi
+    exists=1
+    msg_info "Aktualisiere bestehenden LXC ${VMID} ..."
+    update_lxc
+  elif vm_exists "$VMID"; then
+    [[ "$MODE" == "vm" ]] || die "ID ${VMID} ist eine VM; nutze --vm."
+    if [[ "$FORCE" != "1" ]] && ! is_ours_vm "$VMID"; then
+      die "ID ${VMID} gehört nicht zu ${APP}. Mit --force überschreiben."
+    fi
+    exists=1
+    msg_info "Aktualisiere bestehende VM ${VMID} ..."
+    update_vm
+  else
+    ensure_unique_name
+    if [[ "$MODE" == "lxc" ]]; then
+      create_lxc
+    else
+      create_vm
+    fi
+  fi
+
+  if [[ "$MODE" == "lxc" ]]; then
+    wait_for_ip || die "Keine IPv4-Adresse im Container ${VMID} gefunden."
+    IP="$WAIT_IP"
+  else
+    wait_for_vm_ip || die "Keine IPv4-Adresse in VM ${VMID} gefunden."
+    IP="$WAIT_IP"
+  fi
+  msg_ok "IP: ${IP}"
+
+  run_inner
+  verify_outer || die "Verifikation von außen fehlgeschlagen."
+  summary
+  msg_ok "Installation abgeschlossen (bestehend: ${exists})."
+}
+
 if [[ "${REACTIVE_RESUME_LIB_ONLY:-0}" == "1" ]]; then
   eval "$REACTIVE_RESUME_LIB_SAVED_OPTS"
   return 0 2>/dev/null || exit 0
 fi
 
-# Rest folgt in Task 6/7
-main() {
-  case "${1:-}" in
-    -h|--help) usage; exit 0 ;;
-  esac
-  die "noch nicht implementiert"
-}
-
-trap 'on_error' ERR
 main "$@"

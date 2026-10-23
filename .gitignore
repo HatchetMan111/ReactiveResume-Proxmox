@@ -1,4 +1,6 @@
 .superpowers/
 *.log
 .env
+.env.*
+!.env.example
 .worktrees/

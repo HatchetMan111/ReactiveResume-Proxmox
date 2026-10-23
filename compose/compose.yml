@@ -13,12 +13,15 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 30s
 
   reactive-resume:
     image: ${APP_IMAGE:-amruthpillai/reactive-resume:latest}
     restart: unless-stopped
     ports:
       - "${PORT:-3000}:3000"
+    environment:
+      PORT: "3000"
     env_file:
       - .env
     volumes:

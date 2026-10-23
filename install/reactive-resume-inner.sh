@@ -14,6 +14,7 @@ APP_URL=""
 APP_IMAGE="amruthpillai/reactive-resume:latest"
 LOG_FILE="/var/log/reactive-resume-install.log"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/HatchetMan111/ReactiveResume-Proxmox/main}"
+# DEBUG and SCRIPT_DIR are consumed by Task 4 (CLI parsing and asset lookup).
 # shellcheck disable=SC2034
 DEBUG=0
 SCRIPT_DIR=""
@@ -67,16 +68,25 @@ detect_ip() {
 
 normalize_app_url() {
   local url="${1:-}"
-  url="${url%/}"
-  [[ "$url" =~ ^https?://[^[:space:]]+$ ]] || die "APP_URL muss mit http:// oder https:// beginnen: ${url}"
+  [[ -n "$url" ]] || die "APP_URL darf nicht leer sein."
+  [[ "$url" != *[[:space:]]* ]] || die "APP_URL darf keine Leerzeichen enthalten: ${url}"
+  while [[ "$url" == */ ]]; do url="${url%/}"; done
+  [[ "$url" =~ ^https?://[^/?#[:space:]:][^/?#[:space:]]*([/?#][^[:space:]]*)?$ ]] || die "APP_URL muss mit http:// oder https:// beginnen: ${url}"
   printf '%s\n' "$url"
 }
 
 env_get() {
-  local key="$1" file="$2" line
+  local key="$1" file="$2" line rc=0
   [[ -f "$file" ]] || return 1
-  line="$(grep -E "^${key}=" "$file" | tail -n1 || true)"
+  [[ -r "$file" ]] || return 2
+  line="$(grep -E "^${key}=" "$file")" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
   [[ -n "$line" ]] || return 1
+  line="$(printf '%s\n' "$line" | tail -n1)"
   line="${line#*=}"
   line="${line%\"}"
   line="${line#\"}"
@@ -84,26 +94,50 @@ env_get() {
 }
 
 env_set() {
-  local key="$1" val="$2" file="$3" tmp
-  tmp="$(mktemp)"
+  local key="$1" val="$2" file="$3" tmp rc=0
+  tmp="$(mktemp "${file}.XXXXXX")" || die "Temp-Datei für ${file} konnte nicht erstellt werden."
   if [[ -f "$file" ]]; then
-    grep -vE "^${key}=" "$file" > "$tmp" || true
+    grep -vE "^${key}=" "$file" > "$tmp" || rc=$?
+    case "$rc" in
+      0|1) ;;
+      *) rm -f "$tmp"; die "${file} konnte nicht gelesen werden (Exit ${rc}); keine Änderung geschrieben." ;;
+    esac
   fi
-  printf '%s="%s"\n' "$key" "$val" >> "$tmp"
-  cat "$tmp" > "$file"
-  rm -f "$tmp"
+  printf '%s="%s"\n' "$key" "$val" >> "$tmp" || { rm -f "$tmp"; die "Schreiben nach ${tmp} fehlgeschlagen."; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; die "chmod auf ${tmp} fehlgeschlagen."; }
+  mv -f "$tmp" "$file" || { rm -f "$tmp"; die "${file} konnte nicht ersetzt werden."; }
 }
 
 gen_hex() { openssl rand -hex 32; }
 
 write_env() {
-  local file="$1" pg auth enc db
+  local file="$1" pg auth enc db url rc=0
   mkdir -p "$(dirname "$file")"
+  if ! url="$(normalize_app_url "${APP_URL:-}")"; then
+    die "APP_URL ist ungültig; keine Änderung an ${file} geschrieben."
+  fi
+
+  rc=0; pg="$(env_get POSTGRES_PASSWORD "$file")" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) pg="" ;;
+    *) die "POSTGRES_PASSWORD in ${file} nicht lesbar (Exit ${rc}); keine Secrets neu erzeugt." ;;
+  esac
+  rc=0; auth="$(env_get AUTH_SECRET "$file")" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) auth="" ;;
+    *) die "AUTH_SECRET in ${file} nicht lesbar (Exit ${rc}); keine Secrets neu erzeugt." ;;
+  esac
+  rc=0; enc="$(env_get ENCRYPTION_SECRET "$file")" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) enc="" ;;
+    *) die "ENCRYPTION_SECRET in ${file} nicht lesbar (Exit ${rc}); keine Secrets neu erzeugt." ;;
+  esac
+
   touch "$file"
   chmod 600 "$file"
-  pg="$(env_get POSTGRES_PASSWORD "$file" || true)"
-  auth="$(env_get AUTH_SECRET "$file" || true)"
-  enc="$(env_get ENCRYPTION_SECRET "$file" || true)"
   [[ -n "$pg" ]] || pg="$(gen_hex)"
   [[ -n "$auth" ]] || auth="$(gen_hex)"
   [[ -n "$enc" ]] || enc="$(gen_hex)"
@@ -113,18 +147,18 @@ write_env() {
   env_set DATABASE_URL "$db" "$file"
   env_set AUTH_SECRET "$auth" "$file"
   env_set ENCRYPTION_SECRET "$enc" "$file"
-  env_set APP_URL "$APP_URL" "$file"
+  env_set APP_URL "$url" "$file"
   env_set PORT "$APP_PORT" "$file"
   env_set APP_IMAGE "$APP_IMAGE" "$file"
 }
 
 redact_env() {
   [[ -f "${APP_DIR}/.env" ]] || return 0
-  sed -E 's/^(POSTGRES_PASSWORD|AUTH_SECRET|ENCRYPTION_SECRET|DATABASE_URL)=.*/\1="***"/' "${APP_DIR}/.env"
+  sed -E 's/^((export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*(PASSWORD|SECRET|TOKEN|KEY)[A-Za-z0-9_]*|DATABASE_URL))=.*/\1="***"/' "${APP_DIR}/.env"
 }
 
 on_error() {
-  local ec=$? line="$1" cmd="$2"
+  local ec=$? line="${1:-?}" cmd="${2:-?}"
   trap - ERR
   msg_error "FEHLER: »${cmd}« in Zeile ${line} (Exit ${ec})."
   msg_error "Installer-Log: ${LOG_FILE}"

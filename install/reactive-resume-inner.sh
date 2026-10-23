@@ -13,6 +13,7 @@ APP_PORT="3000"
 APP_URL=""
 APP_IMAGE="amruthpillai/reactive-resume:latest"
 LOG_FILE="/var/log/reactive-resume-install.log"
+UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/HatchetMan111/ReactiveResume-Proxmox/main}"
 # DEBUG and SCRIPT_DIR are consumed by Task 4 (CLI parsing and asset lookup).
 # shellcheck disable=SC2034
@@ -174,10 +175,6 @@ on_error() {
   exit "$ec"
 }
 
-if [[ "${REACTIVE_RESUME_LIB_ONLY:-0}" == "1" ]]; then
-  return 0 2>/dev/null || exit 0
-fi
-
 install_docker() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
@@ -204,25 +201,35 @@ install_compose_file() {
 
 install_unit() {
   local src="${SCRIPT_DIR}/../systemd/reactive-resume.service"
-  local unit="/etc/systemd/system/${APP_ID}.service" tmp
+  local unit="${UNIT_DIR}/${APP_ID}.service" tmp new dir verify_out
   if [[ -f "$src" ]]; then
     tmp="$src"
   else
     tmp="$(mktemp)"
     curl -fsSL --retry 3 -o "$tmp" "${RAW_BASE}/systemd/reactive-resume.service"
   fi
-  sed "s|@APP_DIR@|${APP_DIR}|g" "$tmp" > "$unit"
-  if grep -q '@[A-Z_]*@' "$unit"; then
+  dir="${APP_DIR//\\/\\\\}"
+  dir="${dir//&/\\&}"
+  dir="${dir//|/\\|}"
+  new="$(mktemp "${unit%.service}.XXXXXX.service")"
+  sed "s|@APP_DIR@|${dir}|g" "$tmp" > "$new"
+  if grep -Eq '@[[:alnum:]_]+@' "$new"; then
+    rm -f "$new"
     die "systemd-Unit enthält unersetzte Platzhalter: ${unit}"
   fi
   if command -v systemd-analyze >/dev/null 2>&1; then
-    systemd-analyze verify "$unit" >/dev/null 2>&1 || die "systemd-analyze verify ist für ${unit} fehlgeschlagen."
+    if ! verify_out="$(systemd-analyze verify "$new" 2>&1)"; then
+      printf '%s\n' "$verify_out" >&2
+      rm -f "$new"
+      die "systemd-analyze verify ist für ${unit} fehlgeschlagen."
+    fi
   fi
-  chmod 0644 "$unit"
-  [[ -s "$unit" ]] || die "systemd-Unit konnte nicht installiert werden."
+  chmod 0644 "$new"
+  [[ -s "$new" ]] || { rm -f "$new"; die "systemd-Unit konnte nicht installiert werden."; }
+  mv -f "$new" "$unit"
   [[ "$tmp" == "$src" ]] || rm -f "$tmp"
   systemctl daemon-reload
-  systemctl enable "$APP_ID" >/dev/null 2>&1 || true
+  systemctl enable "$APP_ID" >/dev/null 2>&1 || die "Unit ${APP_ID} konnte nicht aktiviert werden."
 }
 
 verify() {
@@ -275,9 +282,11 @@ main() {
   install_docker
   mkdir -p "$APP_DIR"
   chmod 0755 "$APP_DIR"
-  if [[ "$DEBUG" == "1" ]]; then set +x; fi
+  local xtrace_on=0
+  [[ $- == *x* ]] && xtrace_on=1
+  set +x
   write_env "${APP_DIR}/.env"
-  if [[ "$DEBUG" == "1" ]]; then set -x; fi
+  if (( xtrace_on )); then set -x; fi
   install_compose_file
 
   msg_info "Ziehe Images ..."
@@ -298,5 +307,9 @@ main() {
 
   msg_ok "Reactive Resume läuft unter ${APP_URL}"
 }
+
+if [[ "${REACTIVE_RESUME_LIB_ONLY:-0}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 main "$@"

@@ -40,6 +40,8 @@ IP=""
 WAIT_IP=""
 # shellcheck disable=SC2034 # consumed by Task 6/7 provisioning
 ROOT_PW=""
+# shellcheck disable=SC2034 # consumed by Task 6/7 provisioning
+CREDS_FILE=""
 INSTALLER_REPO="${INSTALLER_REPO:-https://github.com/HatchetMan111/ReactiveResume-Proxmox}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/HatchetMan111/ReactiveResume-Proxmox/main}"
 # shellcheck disable=SC2034 # consumed by Task 6/7 provisioning
@@ -248,6 +250,7 @@ validate_config() {
   command -v pvesm >/dev/null 2>&1 || die "pvesm nicht gefunden."
   command -v pveam >/dev/null 2>&1 || die "pveam nicht gefunden."
   command -v openssl >/dev/null 2>&1 || die "openssl nicht gefunden."
+  command -v curl >/dev/null 2>&1 || die "curl nicht gefunden."
   if [[ "$MODE" == "lxc" ]]; then
     command -v pct >/dev/null 2>&1 || die "pct nicht gefunden."
   else
@@ -330,7 +333,7 @@ wait_for_ip() {
   local i ip
   for i in $(seq 1 60); do
     ip="$(detect_ct_ip)"
-    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    if is_ipv4 "$ip" && [[ "$ip" != 169.254.* && "$ip" != 0.0.0.0 ]]; then
       WAIT_IP="$ip"
       return 0
     fi
@@ -340,7 +343,10 @@ wait_for_ip() {
 }
 
 is_ours_ct() {
-  pct config "$1" 2>/dev/null | grep -qE "(^hostname: ${CT_HOSTNAME}$|${APP})"
+  local cfg
+  cfg="$(pct config "$1" 2>/dev/null || true)"
+  grep -Fq -- "${APP} – installiert von" <<< "$cfg" \
+    || grep -Fxq -- "hostname: ${CT_HOSTNAME}" <<< "$cfg"
 }
 
 ensure_unique_name() {
@@ -353,6 +359,8 @@ ensure_unique_name() {
   if [[ -n "$n" ]]; then
     msg_warn "Name ${CT_HOSTNAME} ist vergeben – nutze ${CT_HOSTNAME}-${VMID}."
     CT_HOSTNAME="${CT_HOSTNAME}-${VMID}"
+    [[ ${#CT_HOSTNAME} -le 63 ]] \
+      || die "Hostname ${CT_HOSTNAME} überschreitet 63 Zeichen – bitte --hostname kürzer wählen."
   fi
 }
 
@@ -377,24 +385,40 @@ create_lxc() {
     --description "${APP} – installiert von ${INSTALLER_REPO}"
   pct start "$VMID"
   wait_for_ct || die "Container ${VMID} bootet nicht (pct exec fehlgeschlagen)."
+  CREDS_FILE="/root/reactive-resume-${VMID}.creds"
   set +x
   ROOT_PW="$(random_password)"
   printf 'root:%s\n' "$ROOT_PW" | pct exec "$VMID" -- chpasswd \
     || die "Root-Passwort konnte im Container nicht gesetzt werden."
+  install -m 600 /dev/null "$CREDS_FILE"
   {
     echo "${APP} – Zugangsdaten"
     echo "CTID: ${VMID}"
     echo "Root-Passwort: ${ROOT_PW}"
     echo "Konsole: pct enter ${VMID}"
-  } > /root/reactive-resume.creds
-  chmod 600 /root/reactive-resume.creds
+  } > "$CREDS_FILE"
+  chmod 600 "$CREDS_FILE"
   ROOT_PW=""
   if (( xtrace_on )); then set -x; fi
-  msg_ok "LXC erstellt. Root-Passwort: /root/reactive-resume.creds"
+  msg_ok "LXC erstellt. Root-Passwort: ${CREDS_FILE}"
 }
 
 update_lxc() {
-  pct set "$VMID" --onboot 1 --features nesting=1,keyctl=1
+  local cur add newf
+  cur="$(pct config "$VMID" 2>/dev/null | awk -F': ' '/^features:/{print $2}' || true)"
+  add=""
+  [[ ",$cur," == *",nesting=1,"* ]] || add+="${add:+,}nesting=1"
+  [[ ",$cur," == *",keyctl=1,"* ]] || add+="${add:+,}keyctl=1"
+  pct set "$VMID" --onboot 1
+  if [[ -n "$add" ]]; then
+    newf="${cur:+${cur},}${add}"
+    pct set "$VMID" --features "$newf"
+    if [[ "$(pct status "$VMID" | awk '{print $2}')" == "running" ]]; then
+      msg_warn "Features geändert – starte Container neu."
+      pct reboot "$VMID"
+      wait_for_ct || die "Container ${VMID} nach Feature-Änderung nicht erreichbar."
+    fi
+  fi
   if [[ "$(pct status "$VMID" | awk '{print $2}')" != "running" ]]; then
     msg_info "Starte bestehenden LXC ${VMID} ..."
     pct start "$VMID"
@@ -457,7 +481,7 @@ summary() {
   echo "  Health      : http://${IP}:${APP_PORT}/api/health"
   if [[ "$MODE" == "lxc" ]]; then
     echo "  Konsole     : pct enter ${VMID}"
-    echo "  Credentials : /root/reactive-resume.creds"
+    echo "  Credentials : ${CREDS_FILE:-/root/reactive-resume-${VMID}.creds}"
   else
     echo "  SSH         : ssh -i ${SSH_KEY_PATH} ${CI_USER}@${IP}"
     echo "  Konsole     : qm terminal ${VMID}"

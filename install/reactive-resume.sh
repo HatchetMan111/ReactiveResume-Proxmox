@@ -258,6 +258,7 @@ validate_config() {
     command -v qemu-img >/dev/null 2>&1 || die "qemu-img nicht gefunden."
     command -v ssh >/dev/null 2>&1 || die "ssh nicht gefunden."
     command -v scp >/dev/null 2>&1 || die "scp nicht gefunden."
+    command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen nicht gefunden."
   fi
   if [[ -n "$STORAGE" ]]; then
     [[ "$STORAGE" =~ ^[A-Za-z0-9._-]+$ ]] || die "--storage enthält ungültige Zeichen."
@@ -492,6 +493,188 @@ summary() {
   echo "  Entfernen   : $([[ "$MODE" == "lxc" ]] && echo "pct stop ${VMID}; pct destroy ${VMID}" || echo "qm stop ${VMID}; qm destroy ${VMID} --purge")"
   echo "  OpenRouter  : Settings → AI & developer → Add provider → OpenRouter"
   echo "═══════════════════════════════════════"
+}
+
+prepare_ssh_key() {
+  mkdir -p "$(dirname "$SSH_KEY_PATH")"
+  if [[ ! -f "$SSH_KEY_PATH" ]]; then
+    msg_info "Erzeuge SSH-Key ${SSH_KEY_PATH} ..."
+    ssh-keygen -q -t ed25519 -N "" -C "${APP_ID}-proxmox" -f "$SSH_KEY_PATH"
+  fi
+  grep -q '^ssh-' "$SSH_KEY_PATH" 2>/dev/null && die "--ssh-key erwartet einen privaten Key."
+  chmod 600 "$SSH_KEY_PATH"
+  if [[ -f "${SSH_KEY_PATH}.pub" ]]; then
+    SSH_PUB="$(cat "${SSH_KEY_PATH}.pub")"
+  else
+    SSH_PUB="$(ssh-keygen -y -P "" -f "$SSH_KEY_PATH" </dev/null)"
+  fi
+  [[ "$SSH_PUB" == ssh-* ]] || die "Konnte keinen Public Key aus ${SSH_KEY_PATH} lesen."
+  SSH_OPTS=(
+    -i "$SSH_KEY_PATH"
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o ConnectTimeout=5
+    -o BatchMode=yes
+    -o ServerAliveInterval=30
+    -o ServerAliveCountMax=20
+  )
+}
+
+ensure_cloud_image() {
+  local arch="amd64" codename="noble" name url
+  [[ "$(uname -m)" == "aarch64" ]] && arch="arm64"
+  name="${codename}-server-cloudimg-${arch}.img"
+  url="https://cloud-images.ubuntu.com/${codename}/current/${name}"
+  CLOUD_IMAGE="/var/lib/vz/template/iso/${name}"
+  mkdir -p "$(dirname "$CLOUD_IMAGE")"
+  if [[ ! -s "$CLOUD_IMAGE" ]]; then
+    msg_info "Lade Ubuntu 24.04 Cloud-Image ..."
+    rm -f "${CLOUD_IMAGE}.part"
+    if ! curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 -o "${CLOUD_IMAGE}.part" "$url"; then
+      rm -f "${CLOUD_IMAGE}.part"
+      die "Download des Cloud-Images fehlgeschlagen: ${url}"
+    fi
+    mv "${CLOUD_IMAGE}.part" "$CLOUD_IMAGE"
+  else
+    msg_ok "Cloud-Image vorhanden: ${CLOUD_IMAGE}"
+  fi
+  qemu-img info "$CLOUD_IMAGE" >/dev/null 2>&1 || die "Cloud-Image ist ungültig."
+}
+
+create_vm() {
+  local import_out disk net
+  ensure_cloud_image
+  prepare_ssh_key
+  [[ -n "$STORAGE" ]] || STORAGE="$(pick_storage images)" || die "Kein Storage für VM-Images gefunden."
+  pvesm status --storage "$STORAGE" >/dev/null 2>&1 || die "Storage ${STORAGE} existiert nicht."
+  net="ip=dhcp"
+  [[ -n "$STATIC_IP" ]] && net="ip=${STATIC_IP},gw=${GATEWAY}"
+
+  msg_info "Erstelle VM ${VMID} (${CT_HOSTNAME}) ..."
+  qm create "$VMID" \
+    --name "$CT_HOSTNAME" \
+    --ostype l26 \
+    --cpu host \
+    --sockets 1 --cores "$CORES" \
+    --memory "$RAM_MB" --balloon 0 \
+    --scsihw virtio-scsi-pci \
+    --net0 "virtio,bridge=${BRIDGE},firewall=0" \
+    --agent enabled=1 \
+    --serial0 socket \
+    --vga std \
+    --onboot 1 \
+    --description "${APP} – installiert von ${INSTALLER_REPO}"
+
+  import_out="$(qm importdisk "$VMID" "$CLOUD_IMAGE" "$STORAGE" 2>&1)"
+  printf '%s\n' "$import_out"
+  disk="$(qm config "$VMID" | awk -F': ' '/^unused0:/ {print $2}')"
+  if [[ -z "$disk" ]]; then
+    disk="$(printf '%s\n' "$import_out" | sed -n "s/.*as '\([^']*\)'.*/\1/p" | tail -n1 | sed -E 's/^unused[0-9]+://')"
+  fi
+  [[ -n "$disk" ]] || die "Importierte Disk konnte nicht ermittelt werden."
+
+  qm set "$VMID" --scsi0 "${disk},discard=on,ssd=1"
+  qm disk resize "$VMID" scsi0 "${DISK_GB}G"
+  qm set "$VMID" --boot "order=scsi0"
+  qm set "$VMID" --ide2 "${STORAGE}:cloudinit"
+
+  SSH_KEYS_TMP="$(mktemp)"
+  chmod 600 "$SSH_KEYS_TMP"
+  printf '%s\n' "$SSH_PUB" > "$SSH_KEYS_TMP"
+  qm set "$VMID" --ciuser "$CI_USER"
+  qm set "$VMID" --sshkeys "$SSH_KEYS_TMP"
+  rm -f "$SSH_KEYS_TMP"; SSH_KEYS_TMP=""
+  qm set "$VMID" --ipconfig0 "$net"
+  qm set "$VMID" --nameserver "1.1.1.1 9.9.9.9"
+  qm set "$VMID" --ciupgrade 0
+
+  qm start "$VMID"
+  msg_ok "VM gestartet."
+}
+
+update_vm() {
+  qm set "$VMID" --onboot 1
+  if [[ "$(qm status "$VMID" | awk '{print $2}')" != "running" ]]; then
+    msg_info "Starte bestehende VM ${VMID} ..."
+    qm start "$VMID"
+  fi
+  prepare_ssh_key
+}
+
+is_ours_vm() {
+  local cfg
+  cfg="$(qm config "$1" 2>/dev/null || true)"
+  grep -Fq -- "${APP} – installiert von" <<< "$cfg" \
+    || grep -Fxq -- "name: ${CT_HOSTNAME}" <<< "$cfg"
+}
+
+agent_ping() {
+  timeout 10 qm agent "$VMID" ping >/dev/null 2>&1
+}
+
+detect_vm_ip() {
+  local json ip mac
+  if agent_ping; then
+    json="$(timeout 20 qm guest cmd "$VMID" network-get-interfaces 2>/dev/null || true)"
+  else
+    json=""
+  fi
+  if [[ -n "$json" ]] && command -v python3 >/dev/null 2>&1; then
+    ip="$(printf '%s' "$json" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for iface in data:
+    name = iface.get("name", "")
+    if name == "lo" or name.startswith(("docker", "br-", "veth", "virbr", "tun", "tap")):
+        continue
+    for addr in iface.get("ip-addresses", []):
+        if addr.get("ip-address-type") == "ipv4":
+            v = addr.get("ip-address", "")
+            if v and not v.startswith(("127.", "169.254.")):
+                print(v)
+                sys.exit(0)
+sys.exit(1)
+' 2>/dev/null || true)"
+    [[ -n "$ip" ]] && { printf '%s\n' "$ip"; return 0; }
+  fi
+  mac="$(qm config "$VMID" 2>/dev/null | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -n1 || true)"
+  if [[ -n "$mac" ]]; then
+    ip="$(ip neigh show dev "$BRIDGE" 2>/dev/null | grep -i "$mac" | awk '{print $1}' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | grep -v '^169\.254\.' | head -n1 || true)"
+    [[ -n "$ip" ]] && { printf '%s\n' "$ip"; return 0; }
+  fi
+  return 1
+}
+
+sweep_bridge() {
+  local subnet i
+  subnet="$(ip -4 -o addr show dev "$BRIDGE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | cut -d. -f1-3 || true)"
+  [[ "$subnet" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
+  for i in $(seq 1 254); do ping -c1 -W1 "${subnet}.${i}" >/dev/null 2>&1 & done
+  wait 2>/dev/null || true
+}
+
+wait_vm_ssh() {
+  local i candidate
+  for i in $(seq 1 120); do
+    if (( i == 1 || i % 12 == 0 )); then sweep_bridge; fi
+    candidate="$(detect_vm_ip 2>/dev/null || true)"
+    [[ -n "$candidate" ]] && WAIT_IP="$candidate"
+    if [[ -n "${WAIT_IP:-}" ]] && ssh "${SSH_OPTS[@]}" "${CI_USER}@${WAIT_IP}" true >/dev/null 2>&1; then
+      return 0
+    fi
+    if (( i % 6 == 0 )); then
+      msg_info "  ... warte auf SSH (${i}/120, IP: ${WAIT_IP:-?})"
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+wait_for_vm_ip() {
+  wait_vm_ssh
 }
 
 main() {

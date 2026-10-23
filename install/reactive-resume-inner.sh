@@ -199,34 +199,59 @@ install_compose_file() {
   [[ -s "$dst" ]] || die "compose.yml konnte nicht installiert werden."
 }
 
+cleanup_unit_stage() {
+  local new="$1" tmp="$2" src="$3"
+  rm -f "$new"
+  [[ "$tmp" == "$src" ]] || rm -f "$tmp"
+}
+
 install_unit() {
   local src="${SCRIPT_DIR}/../systemd/reactive-resume.service"
   local unit="${UNIT_DIR}/${APP_ID}.service" tmp new dir verify_out
+  mkdir -p "$UNIT_DIR" || die "Verzeichnis ${UNIT_DIR} konnte nicht erstellt werden."
   if [[ -f "$src" ]]; then
     tmp="$src"
   else
     tmp="$(mktemp)"
-    curl -fsSL --retry 3 -o "$tmp" "${RAW_BASE}/systemd/reactive-resume.service"
+    if ! curl -fsSL --retry 3 -o "$tmp" "${RAW_BASE}/systemd/reactive-resume.service"; then
+      rm -f "$tmp"
+      die "systemd-Unit konnte nicht geladen werden."
+    fi
   fi
   dir="${APP_DIR//\\/\\\\}"
   dir="${dir//&/\\&}"
   dir="${dir//|/\\|}"
-  new="$(mktemp "${unit%.service}.XXXXXX.service")"
-  sed "s|@APP_DIR@|${dir}|g" "$tmp" > "$new"
+  if ! new="$(mktemp "${unit%.service}.XXXXXX.service")"; then
+    [[ "$tmp" == "$src" ]] || rm -f "$tmp"
+    die "Temporäre Unit-Datei konnte nicht erstellt werden."
+  fi
+  if ! sed "s|@APP_DIR@|${dir}|g" "$tmp" > "$new"; then
+    cleanup_unit_stage "$new" "$tmp" "$src"
+    die "systemd-Unit konnte nicht erzeugt werden."
+  fi
+  if [[ ! -s "$new" ]]; then
+    cleanup_unit_stage "$new" "$tmp" "$src"
+    die "systemd-Unit konnte nicht installiert werden."
+  fi
   if grep -Eq '@[[:alnum:]_]+@' "$new"; then
-    rm -f "$new"
+    cleanup_unit_stage "$new" "$tmp" "$src"
     die "systemd-Unit enthält unersetzte Platzhalter: ${unit}"
   fi
   if command -v systemd-analyze >/dev/null 2>&1; then
     if ! verify_out="$(systemd-analyze verify "$new" 2>&1)"; then
       printf '%s\n' "$verify_out" >&2
-      rm -f "$new"
+      cleanup_unit_stage "$new" "$tmp" "$src"
       die "systemd-analyze verify ist für ${unit} fehlgeschlagen."
     fi
   fi
-  chmod 0644 "$new"
-  [[ -s "$new" ]] || { rm -f "$new"; die "systemd-Unit konnte nicht installiert werden."; }
-  mv -f "$new" "$unit"
+  if ! chmod 0644 "$new"; then
+    cleanup_unit_stage "$new" "$tmp" "$src"
+    die "chmod auf ${unit} fehlgeschlagen."
+  fi
+  if ! mv -f "$new" "$unit"; then
+    cleanup_unit_stage "$new" "$tmp" "$src"
+    die "systemd-Unit konnte nicht installiert werden."
+  fi
   [[ "$tmp" == "$src" ]] || rm -f "$tmp"
   systemctl daemon-reload
   systemctl enable "$APP_ID" >/dev/null 2>&1 || die "Unit ${APP_ID} konnte nicht aktiviert werden."

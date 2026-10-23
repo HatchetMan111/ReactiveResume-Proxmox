@@ -20,6 +20,8 @@ done
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+LOG_FILE="$TMP/install.log"
+export LOG_FILE
 
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/systemctl" <<'STUB'
@@ -33,7 +35,7 @@ STUB
 chmod +x "$TMP/bin/systemctl" "$TMP/bin/systemd-analyze"
 export PATH="$TMP/bin:${PATH}"
 
-APP_DIR="$TMP/app dir & pipe|x"
+APP_DIR="$TMP/app\\slash & pipe|x"
 
 # Valid unit: placeholder substitution, no leftovers, atomic install.
 UNIT_DIR="$TMP/unit-ok"
@@ -60,6 +62,23 @@ fi
 [[ ! -e "$UNIT_DIR/${APP_ID}.service" ]] || fail "fehlerhafte Unit wurde installiert"
 if compgen -G "${UNIT_DIR}/${APP_ID}.*.service" >/dev/null; then
   fail "temporäre Unit-Datei wurde nicht aufgeräumt"
+fi
+
+# mv failure: staged temp must be removed even when the final move fails.
+UNIT_DIR="$TMP/unit-mv"
+mkdir -p "$UNIT_DIR" "$TMP/mv/install" "$TMP/mv/systemd" "$TMP/failbin"
+cp "$UNIT_SOURCE" "$TMP/mv/systemd/reactive-resume.service"
+cat > "$TMP/failbin/mv" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+chmod +x "$TMP/failbin/mv"
+SCRIPT_DIR="$TMP/mv/install"
+if ( PATH="$TMP/failbin:${PATH}" install_unit ) 2>/dev/null; then
+  fail "install_unit hätte bei mv-Fehler fehlschlagen müssen"
+fi
+if compgen -G "${UNIT_DIR}/${APP_ID}.*.service" >/dev/null; then
+  fail "temporäre Unit-Datei blieb nach mv-Fehler zurück"
 fi
 
 printf 'inner-functions: PASS\n'

@@ -79,7 +79,7 @@ env_get() {
   local key="$1" file="$2" line rc=0
   [[ -f "$file" ]] || return 1
   [[ -r "$file" ]] || return 2
-  line="$(grep -E "^${key}=" "$file")" || rc=$?
+  line="$(grep -E "^([[:space:]]*export[[:space:]]+)?${key}=" "$file")" || rc=$?
   case "$rc" in
     0) ;;
     1) return 1 ;;
@@ -97,7 +97,7 @@ env_set() {
   local key="$1" val="$2" file="$3" tmp rc=0
   tmp="$(mktemp "${file}.XXXXXX")" || die "Temp-Datei für ${file} konnte nicht erstellt werden."
   if [[ -f "$file" ]]; then
-    grep -vE "^${key}=" "$file" > "$tmp" || rc=$?
+    grep -vE "^([[:space:]]*export[[:space:]]+)?${key}=" "$file" > "$tmp" || rc=$?
     case "$rc" in
       0|1) ;;
       *) rm -f "$tmp"; die "${file} konnte nicht gelesen werden (Exit ${rc}); keine Änderung geschrieben." ;;
@@ -111,11 +111,9 @@ env_set() {
 gen_hex() { openssl rand -hex 32; }
 
 write_env() {
-  local file="$1" pg auth enc db url rc=0
+  local file="$1" pg auth enc db rc=0
   mkdir -p "$(dirname "$file")"
-  if ! url="$(normalize_app_url "${APP_URL:-}")"; then
-    die "APP_URL ist ungültig; keine Änderung an ${file} geschrieben."
-  fi
+  APP_URL="$(normalize_app_url "${APP_URL:-}")" || exit 1
 
   rc=0; pg="$(env_get POSTGRES_PASSWORD "$file")" || rc=$?
   case "$rc" in
@@ -147,14 +145,14 @@ write_env() {
   env_set DATABASE_URL "$db" "$file"
   env_set AUTH_SECRET "$auth" "$file"
   env_set ENCRYPTION_SECRET "$enc" "$file"
-  env_set APP_URL "$url" "$file"
+  env_set APP_URL "$APP_URL" "$file"
   env_set PORT "$APP_PORT" "$file"
   env_set APP_IMAGE "$APP_IMAGE" "$file"
 }
 
 redact_env() {
   [[ -f "${APP_DIR}/.env" ]] || return 0
-  sed -E 's/^((export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*(PASSWORD|SECRET|TOKEN|KEY)[A-Za-z0-9_]*|DATABASE_URL))=.*/\1="***"/' "${APP_DIR}/.env"
+  sed -E 's/^((export[[:space:]]+)?(([A-Za-z_][A-Za-z0-9_]*)?(PASSWORD|SECRET|TOKEN|KEY)[A-Za-z0-9_]*|DATABASE_URL))=.*/\1="***"/' "${APP_DIR}/.env"
 }
 
 on_error() {

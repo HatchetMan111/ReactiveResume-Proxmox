@@ -178,8 +178,125 @@ if [[ "${REACTIVE_RESUME_LIB_ONLY:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
 fi
 
-# main folgt in Task 4
-main() {
-  die "noch nicht implementiert"
+install_docker() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq curl ca-certificates openssl >/dev/null
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    msg_ok "Docker und Compose sind bereits vorhanden."
+  else
+    msg_info "Installiere Docker CE ..."
+    curl -fsSL --retry 3 https://get.docker.com | sh
+  fi
+  systemctl enable --now docker
+  docker compose version >/dev/null 2>&1 || die "docker compose Plugin fehlt nach der Installation."
 }
+
+install_compose_file() {
+  local dst="${APP_DIR}/compose.yml"
+  if [[ -f "${SCRIPT_DIR}/../compose/compose.yml" ]]; then
+    install -m 0644 "${SCRIPT_DIR}/../compose/compose.yml" "$dst"
+  else
+    curl -fsSL --retry 3 -o "$dst" "${RAW_BASE}/compose/compose.yml"
+  fi
+  [[ -s "$dst" ]] || die "compose.yml konnte nicht installiert werden."
+}
+
+install_unit() {
+  local src="${SCRIPT_DIR}/../systemd/reactive-resume.service"
+  local unit="/etc/systemd/system/${APP_ID}.service" tmp
+  if [[ -f "$src" ]]; then
+    tmp="$src"
+  else
+    tmp="$(mktemp)"
+    curl -fsSL --retry 3 -o "$tmp" "${RAW_BASE}/systemd/reactive-resume.service"
+  fi
+  sed "s|@APP_DIR@|${APP_DIR}|g" "$tmp" > "$unit"
+  if grep -q '@[A-Z_]*@' "$unit"; then
+    die "systemd-Unit enthält unersetzte Platzhalter: ${unit}"
+  fi
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze verify "$unit" >/dev/null 2>&1 || die "systemd-analyze verify ist für ${unit} fehlgeschlagen."
+  fi
+  chmod 0644 "$unit"
+  [[ -s "$unit" ]] || die "systemd-Unit konnte nicht installiert werden."
+  [[ "$tmp" == "$src" ]] || rm -f "$tmp"
+  systemctl daemon-reload
+  systemctl enable "$APP_ID" >/dev/null 2>&1 || true
+}
+
+verify() {
+  local code
+  for _ in $(seq 1 90); do
+    if systemctl is-active --quiet "$APP_ID"; then
+      code="$(curl -s -o /tmp/reactive-resume-health.json -m 5 -w '%{http_code}' \
+        "http://127.0.0.1:${APP_PORT}/api/health" 2>/dev/null || true)"
+      if [[ "$code" == "200" ]] && grep -Eq '"status"[[:space:]]*:[[:space:]]*"healthy"' /tmp/reactive-resume-health.json; then
+        msg_ok "Healthcheck OK (HTTP 200, status healthy)."
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+  die "Healthcheck fehlgeschlagen (letzter HTTP-Code: ${code:-000}); Dienststatus: $(systemctl is-active "$APP_ID" 2>/dev/null || true)."
+}
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) APP_PORT="$2"; shift 2 ;;
+      --app-url) APP_URL="$2"; shift 2 ;;
+      --app-image) APP_IMAGE="$2"; shift 2 ;;
+      --app-dir) APP_DIR="$2"; shift 2 ;;
+      --debug) DEBUG=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unbekannte Option: $1" ;;
+    esac
+  done
+
+  APP_PORT="$(normalize_port "$APP_PORT")"
+  [[ -n "$APP_IMAGE" ]] || die "APP_IMAGE darf nicht leer sein."
+  [[ "$(id -u)" == "0" ]] || die "Bitte als root ausführen."
+
+  mkdir -p "$(dirname "$LOG_FILE")"
+  : > "$LOG_FILE"
+  chmod 600 "$LOG_FILE"
+  exec > >(tee -i "$LOG_FILE") 2>&1
+  trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
+  if [[ "$DEBUG" == "1" ]]; then set -x; fi
+
+  if [[ -z "$APP_URL" ]]; then
+    APP_URL="http://$(detect_ip || die "IP konnte nicht ermittelt werden."):${APP_PORT}"
+  fi
+  APP_URL="$(normalize_app_url "$APP_URL")"
+  msg_info "APP_URL: ${APP_URL}"
+  msg_info "APP_IMAGE: ${APP_IMAGE}"
+
+  install_docker
+  mkdir -p "$APP_DIR"
+  chmod 0755 "$APP_DIR"
+  if [[ "$DEBUG" == "1" ]]; then set +x; fi
+  write_env "${APP_DIR}/.env"
+  if [[ "$DEBUG" == "1" ]]; then set -x; fi
+  install_compose_file
+
+  msg_info "Ziehe Images ..."
+  ( cd "$APP_DIR" && docker compose pull )
+
+  install_unit
+
+  msg_info "Starte Compose-Stack ..."
+  ( cd "$APP_DIR" && docker compose up -d --remove-orphans --wait --wait-timeout 300 )
+  systemctl restart "$APP_ID"
+
+  verify
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw allow "${APP_PORT}/tcp" >/dev/null 2>&1 || true
+    msg_ok "ufw: Port ${APP_PORT}/tcp freigegeben."
+  fi
+
+  msg_ok "Reactive Resume läuft unter ${APP_URL}"
+}
+
 main "$@"

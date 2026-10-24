@@ -13,13 +13,24 @@ APP_ID="reactive-resume"
 TYPE=""
 
 SSH_KEY="${SSH_KEY_PATH:-/root/.ssh/reactive-resume_vm_ed25519}"
+# Host-Key-Prüfung bewusst aus: der Test spricht einen Wegwerf-Gast an, dessen
+# Host-Key sich beim Neuaufsetzen ändert; IdentitiesOnly begrenzt den Key.
 SSH_OPTS=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o PreferredAuthentications=publickey
           -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
           -o ConnectTimeout=5)
 
 die() { echo "FEHLER: $*" >&2; exit 1; }
 
-usage() { echo "Usage: $0 <ID> [IP] [PORT]" >&2; exit 1; }
+usage() {
+  cat >&2 <<'EOF'
+Usage: reboot-test.sh <ID> [IP] [PORT]
+
+Umgebung:
+  SSH_KEY_PATH=<pfad>  privater SSH-Key für VM (Default: /root/.ssh/reactive-resume_vm_ed25519)
+  REBOOT_TEST_FORCE=1  überspringt nur die Ownership-Prüfung
+EOF
+  exit 1
+}
 
 is_ipv4() {
   local ip="$1" o
@@ -36,6 +47,7 @@ is_ipv4() {
 [[ "$ID" =~ ^[0-9]+$ ]] || die "ID muss numerisch sein."
 [[ "$PORT" =~ ^[0-9]+$ ]] || die "PORT muss numerisch sein."
 (( 10#$PORT >= 1 && 10#$PORT <= 65535 )) || die "PORT muss zwischen 1 und 65535 liegen."
+PORT=$((10#$PORT))
 if [[ -n "$IP" ]]; then
   is_ipv4 "$IP" || die "IP '${IP}' ist keine gültige IPv4-Adresse."
 fi
@@ -109,13 +121,14 @@ is_ours() {
     cfg="$(pct config "$ID" 2>/dev/null || true)"
     if grep -Fq -- "description: Reactive Resume – installiert von" <<< "$cfg"; then return 0; fi
     if grep -Fxq 'hostname: reactive-resume' <<< "$cfg"; then return 0; fi
-  else
-    cfg="$(qm config "$ID" 2>/dev/null || true)"
-    if grep -Fq -- "description: Reactive Resume – installiert von" <<< "$cfg"; then return 0; fi
-    if grep -Fxq 'name: reactive-resume' <<< "$cfg"; then return 0; fi
+    guest_hostname="$(run_in "$ip" 'hostname' 2>/dev/null || true)"
+    [[ "$guest_hostname" == "reactive-resume" ]]
+    return
   fi
-  guest_hostname="$(run_in "$ip" 'hostname' 2>/dev/null || true)"
-  [[ "$guest_hostname" == "reactive-resume" ]]
+  cfg="$(qm config "$ID" 2>/dev/null || true)"
+  if grep -Fq -- "description: Reactive Resume – installiert von" <<< "$cfg"; then return 0; fi
+  if grep -Fxq 'name: reactive-resume' <<< "$cfg"; then return 0; fi
+  return 1
 }
 
 check_all() {
@@ -130,7 +143,7 @@ check_all() {
   fi
 
   echo "--- ${phase}: systemd ---"
-  run_in "$ip" "systemctl is-active ${APP_ID}"
+  run_in "$ip" "systemctl is-active ${APP_ID}" || die "Dienst ${APP_ID} nicht aktiv."
   run_in "$ip" "systemctl status ${APP_ID} --no-pager -l | tail -n 20"
 
   echo "--- ${phase}: Compose ---"
@@ -140,7 +153,8 @@ check_all() {
   health="$(run_in "$ip" "curl -fsS -m 5 http://127.0.0.1:${PORT}/api/health")" \
     || die "Lokaler Health-Check fehlgeschlagen."
   printf '%s\n' "$health"
-  [[ "$health" == *'"status":"healthy"'* ]] || die "Health-Antwort ohne status=healthy."
+  printf '%s\n' "$health" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"healthy"' \
+    || die "Health-Antwort ohne status=healthy."
 
   echo "--- ${phase}: Health von außen (${ip}) ---"
   code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${ip}:${PORT}/api/health" || true)"
@@ -161,8 +175,18 @@ check_all() {
 }
 
 echo "== Vor dem Reboot =="
-[[ -n "$IP" ]] || IP="$(detect_ip || true)"
-[[ -n "$IP" ]] || die "IP nicht ermittelbar; bitte als Argument angeben."
+if [[ "$TYPE" == "vm" ]]; then
+  detected="$(detect_ip || true)"
+  if [[ -n "$IP" && -n "$detected" && "$detected" != "$IP" ]]; then
+    die "IP ${IP} gehört nicht zu VM ${ID} (erkannt: ${detected})."
+  fi
+  [[ -n "$IP" ]] || IP="$detected"
+  [[ -n "$IP" ]] || die "IP nicht ermittelbar; bitte als Argument angeben."
+else
+  [[ -n "$IP" ]] || IP="$(detect_ip || true)"
+  [[ -n "$IP" ]] || die "IP nicht ermittelbar; bitte als Argument angeben."
+fi
+last_notified_ip="$IP"
 
 if [[ "${REBOOT_TEST_FORCE:-0}" != "1" ]] && ! is_ours "$IP"; then
   die "ID ${ID} gehört nicht zu Reactive Resume (Marker/Hostname fehlt). Mit REBOOT_TEST_FORCE=1 überschreibbar."
@@ -187,8 +211,9 @@ DEADLINE=$((SECONDS + 600))
 while ((SECONDS < DEADLINE)); do
   detected="$(detect_ip || true)"
   if [[ -n "$detected" ]]; then
-    if [[ "$detected" != "$IP" ]]; then
+    if [[ "$detected" != "$last_notified_ip" ]]; then
       echo "HINWEIS: IP hat sich geändert: ${IP} -> ${detected}"
+      last_notified_ip="$detected"
     fi
     NEW_IP="$detected"
   fi
@@ -209,8 +234,9 @@ DEADLINE=$((SECONDS + 300))
 while ((SECONDS < DEADLINE)); do
   detected="$(detect_ip || true)"
   if [[ -n "$detected" ]]; then
-    if [[ "$detected" != "$IP" ]]; then
+    if [[ "$detected" != "$last_notified_ip" ]]; then
       echo "HINWEIS: IP hat sich geändert: ${IP} -> ${detected}"
+      last_notified_ip="$detected"
     fi
     IP="$detected"
   fi

@@ -12,97 +12,213 @@ PORT="${3:-3000}"
 APP_ID="reactive-resume"
 TYPE=""
 
-[[ -n "$ID" ]] || { echo "Usage: $0 <ID> [IP] [PORT]" >&2; exit 1; }
+SSH_KEY="${SSH_KEY_PATH:-/root/.ssh/reactive-resume_vm_ed25519}"
+SSH_OPTS=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o PreferredAuthentications=publickey
+          -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          -o ConnectTimeout=5)
+
+die() { echo "FEHLER: $*" >&2; exit 1; }
+
+usage() { echo "Usage: $0 <ID> [IP] [PORT]" >&2; exit 1; }
+
+is_ipv4() {
+  local ip="$1" o
+  local -a octets=()
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS=. read -r -a octets <<< "$ip"
+  for o in "${octets[@]}"; do
+    (( 10#$o <= 255 )) || return 1
+  done
+  return 0
+}
+
+[[ -n "$ID" ]] || usage
+[[ "$ID" =~ ^[0-9]+$ ]] || die "ID muss numerisch sein."
+[[ "$PORT" =~ ^[0-9]+$ ]] || die "PORT muss numerisch sein."
+(( 10#$PORT >= 1 && 10#$PORT <= 65535 )) || die "PORT muss zwischen 1 und 65535 liegen."
+if [[ -n "$IP" ]]; then
+  is_ipv4 "$IP" || die "IP '${IP}' ist keine gültige IPv4-Adresse."
+fi
 
 if pct status "$ID" >/dev/null 2>&1; then
   TYPE="lxc"
 elif qm status "$ID" >/dev/null 2>&1; then
   TYPE="vm"
 else
-  echo "FEHLER: ID ${ID} ist weder LXC noch VM." >&2
-  exit 1
+  die "ID ${ID} ist weder LXC noch VM."
+fi
+
+if [[ "$TYPE" == "vm" ]]; then
+  [[ -r "$SSH_KEY" ]] || die "SSH-Key ${SSH_KEY} nicht lesbar (VM-Modus)."
 fi
 
 run_in() {
+  local ip="$1" cmd="$2"
   if [[ "$TYPE" == "lxc" ]]; then
-    pct exec "$ID" -- bash -lc "$1"
+    pct exec "$ID" -- bash -lc "$cmd"
   else
-    printf '%s\n' "$1" | ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      -o ConnectTimeout=5 "ubuntu@${IP}" 'sudo bash -s'
+    printf '%s\n' "$cmd" | ssh "${SSH_OPTS[@]}" "ubuntu@${ip}" 'sudo bash -s'
   fi
 }
 
 detect_ip() {
+  local json="" ip="" mac=""
   if [[ "$TYPE" == "lxc" ]]; then
     pct exec "$ID" -- ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1
   else
-    timeout 20 qm guest cmd "$ID" network-get-interfaces 2>/dev/null | \
-      grep -oE '"ip-address"[[:space:]]*:[[:space:]]*"[0-9.]+"' | \
-      grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -vE '^(127\.|169\.254\.)' | head -n1
+    json="$(timeout 20 qm guest cmd "$ID" network-get-interfaces 2>/dev/null || true)"
+    if [[ -n "$json" ]] && command -v python3 >/dev/null 2>&1; then
+      ip="$(printf '%s' "$json" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for iface in data:
+    name = iface.get("name", "")
+    if name == "lo" or name.startswith(("docker", "br-", "veth", "virbr", "tun", "tap")):
+        continue
+    for addr in iface.get("ip-addresses", []):
+        if addr.get("ip-address-type") == "ipv4":
+            v = addr.get("ip-address", "")
+            if v and not v.startswith(("127.", "169.254.")):
+                print(v)
+                sys.exit(0)
+sys.exit(1)
+' 2>/dev/null || true)"
+      if [[ -n "$ip" ]] && is_ipv4 "$ip"; then
+        printf '%s\n' "$ip"
+        return 0
+      fi
+    fi
+    mac="$(qm config "$ID" 2>/dev/null | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -n1 || true)"
+    if [[ -n "$mac" ]]; then
+      ip="$(ip neigh show 2>/dev/null | grep -i "$mac" | awk '{print $1}' \
+        | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | grep -v '^169\.254\.' | head -n1 || true)"
+      if [[ -n "$ip" ]] && is_ipv4 "$ip"; then
+        printf '%s\n' "$ip"
+        return 0
+      fi
+    fi
   fi
 }
 
+is_ours() {
+  local ip="$1" cfg="" guest_hostname=""
+  if [[ "$TYPE" == "lxc" ]]; then
+    cfg="$(pct config "$ID" 2>/dev/null || true)"
+    if grep -Fq -- "description: Reactive Resume – installiert von" <<< "$cfg"; then return 0; fi
+    if grep -Fxq 'hostname: reactive-resume' <<< "$cfg"; then return 0; fi
+  else
+    cfg="$(qm config "$ID" 2>/dev/null || true)"
+    if grep -Fq -- "description: Reactive Resume – installiert von" <<< "$cfg"; then return 0; fi
+    if grep -Fxq 'name: reactive-resume' <<< "$cfg"; then return 0; fi
+  fi
+  guest_hostname="$(run_in "$ip" 'hostname' 2>/dev/null || true)"
+  [[ "$guest_hostname" == "reactive-resume" ]]
+}
+
 check_all() {
-  local phase="$1" ip="$2" code
+  local phase="$1" ip="$2" code health app_url app_url_rc=0
   echo "--- ${phase}: Status ---"
   if [[ "$TYPE" == "lxc" ]]; then
     pct status "$ID"
-    pct config "$ID" | grep -E '^(onboot|features|hostname):'
+    pct config "$ID" | grep -E '^(onboot|features|hostname):' || true
   else
     qm status "$ID"
-    qm config "$ID" | grep -E '^(onboot|name):'
+    qm config "$ID" | grep -E '^(onboot|name):' || true
   fi
 
   echo "--- ${phase}: systemd ---"
-  run_in "systemctl is-active ${APP_ID}"
-  run_in "systemctl status ${APP_ID} --no-pager -l | tail -n 20"
+  run_in "$ip" "systemctl is-active ${APP_ID}"
+  run_in "$ip" "systemctl status ${APP_ID} --no-pager -l | tail -n 20"
 
   echo "--- ${phase}: Compose ---"
-  run_in "cd /opt/reactive-resume && docker compose ps"
+  run_in "$ip" "cd /opt/reactive-resume && docker compose ps"
 
   echo "--- ${phase}: Health lokal ---"
-  run_in "curl -fsS http://127.0.0.1:${PORT}/api/health"
+  health="$(run_in "$ip" "curl -fsS -m 5 http://127.0.0.1:${PORT}/api/health")" \
+    || die "Lokaler Health-Check fehlgeschlagen."
+  printf '%s\n' "$health"
+  [[ "$health" == *'"status":"healthy"'* ]] || die "Health-Antwort ohne status=healthy."
 
   echo "--- ${phase}: Health von außen (${ip}) ---"
   code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${ip}:${PORT}/api/health" || true)"
   echo "HTTP ${code}"
-  [[ "$code" == "200" ]] || return 1
+  [[ "$code" == "200" ]] || die "Externer Health-Check lieferte HTTP ${code:-?} statt 200."
 
   echo "--- ${phase}: APP_URL ---"
-  run_in "grep '^APP_URL=' /opt/reactive-resume/.env"
-  if ! run_in "grep -q '^APP_URL=\"http://${ip}:${PORT}\"' /opt/reactive-resume/.env"; then
-    echo "WARNUNG: APP_URL passt nicht zur aktuellen IP ${ip}. Login kann fehlschlagen." >&2
+  app_url="$(run_in "$ip" "grep '^APP_URL=' /opt/reactive-resume/.env" 2>/dev/null)" \
+    || app_url_rc=$?
+  if (( app_url_rc != 0 )); then
+    echo "WARNUNG: APP_URL konnte nicht gelesen werden." >&2
+  else
+    printf '%s\n' "$app_url"
+    if [[ "$app_url" != "APP_URL=\"http://${ip}:${PORT}\"" ]]; then
+      echo "WARNUNG: APP_URL passt nicht zur aktuellen IP ${ip}. Login kann fehlschlagen." >&2
+    fi
   fi
 }
 
 echo "== Vor dem Reboot =="
 [[ -n "$IP" ]] || IP="$(detect_ip || true)"
-[[ -n "$IP" ]] || { echo "FEHLER: IP nicht ermittelbar; bitte als Argument angeben." >&2; exit 1; }
+[[ -n "$IP" ]] || die "IP nicht ermittelbar; bitte als Argument angeben."
+
+if [[ "${REBOOT_TEST_FORCE:-0}" != "1" ]] && ! is_ours "$IP"; then
+  die "ID ${ID} gehört nicht zu Reactive Resume (Marker/Hostname fehlt). Mit REBOOT_TEST_FORCE=1 überschreibbar."
+fi
+
 check_all "vorher" "$IP"
+OLD_BOOT="$(run_in "$IP" 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)"
+[[ -n "$OLD_BOOT" ]] || die "Boot-ID vor Reboot nicht lesbar."
+echo "Boot-ID vor Reboot: ${OLD_BOOT}"
 
 echo "== Reboot =="
 if [[ "$TYPE" == "lxc" ]]; then
-  pct reboot "$ID"
-  for _ in $(seq 1 60); do pct exec "$ID" -- true >/dev/null 2>&1 && break; sleep 2; done
+  pct reboot "$ID" || die "pct reboot ${ID} fehlgeschlagen."
 else
-  qm reboot "$ID"
-  for _ in $(seq 1 120); do
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
-      "ubuntu@${IP}" true >/dev/null 2>&1 && break
-    sleep 5
-  done
+  qm reboot "$ID" || die "qm reboot ${ID} fehlgeschlagen."
 fi
 
 echo "== Nach dem Reboot =="
-NEW_IP="$(detect_ip || true)"
-[[ -n "$NEW_IP" ]] || NEW_IP="$IP"
-[[ "$NEW_IP" == "$IP" ]] || echo "HINWEIS: IP hat sich geändert: ${IP} -> ${NEW_IP}"
-for _ in $(seq 1 90); do
-  code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${NEW_IP}:${PORT}/api/health" || true)"
+NEW_IP=""
+NEW_BOOT=""
+DEADLINE=$((SECONDS + 600))
+while ((SECONDS < DEADLINE)); do
+  detected="$(detect_ip || true)"
+  if [[ -n "$detected" ]]; then
+    if [[ "$detected" != "$IP" ]]; then
+      echo "HINWEIS: IP hat sich geändert: ${IP} -> ${detected}"
+    fi
+    NEW_IP="$detected"
+  fi
+  probe_ip="${NEW_IP:-$IP}"
+  NEW_BOOT="$(run_in "$probe_ip" 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)"
+  if [[ -n "$NEW_BOOT" && "$NEW_BOOT" != "$OLD_BOOT" ]]; then
+    IP="$probe_ip"
+    break
+  fi
+  if [[ "$TYPE" == "lxc" ]]; then sleep 2; else sleep 5; fi
+done
+[[ -n "$NEW_BOOT" && "$NEW_BOOT" != "$OLD_BOOT" ]] \
+  || die "Reboot nicht nachweisbar: Boot-ID blieb innerhalb von 600s unverändert."
+echo "Boot-ID nach Reboot: ${NEW_BOOT}"
+
+code=""
+DEADLINE=$((SECONDS + 300))
+while ((SECONDS < DEADLINE)); do
+  detected="$(detect_ip || true)"
+  if [[ -n "$detected" ]]; then
+    if [[ "$detected" != "$IP" ]]; then
+      echo "HINWEIS: IP hat sich geändert: ${IP} -> ${detected}"
+    fi
+    IP="$detected"
+  fi
+  code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${IP}:${PORT}/api/health" || true)"
   [[ "$code" == "200" ]] && break
   sleep 2
 done
-IP="$NEW_IP"
-check_all "nachher" "$NEW_IP"
+[[ "$code" == "200" ]] || die "Health nach Reboot nicht 200 (letzter HTTP ${code:-?})."
+check_all "nachher" "$IP"
 
 echo "== Reboot-Test bestanden =="

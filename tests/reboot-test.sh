@@ -73,6 +73,15 @@ run_in() {
   fi
 }
 
+boot_marker() {
+  local ip="$1"
+  if [[ "$TYPE" == "lxc" ]]; then
+    run_in "$ip" "awk '{print \$22}' /proc/1/stat"
+  else
+    run_in "$ip" "cat /proc/sys/kernel/random/boot_id"
+  fi
+}
+
 detect_ip() {
   local json="" ip="" mac=""
   if [[ "$TYPE" == "lxc" ]]; then
@@ -177,10 +186,15 @@ check_all() {
 echo "== Vor dem Reboot =="
 if [[ "$TYPE" == "vm" ]]; then
   detected="$(detect_ip || true)"
-  if [[ -n "$IP" && -n "$detected" && "$detected" != "$IP" ]]; then
-    die "IP ${IP} gehört nicht zu VM ${ID} (erkannt: ${detected})."
+  if [[ -n "$IP" ]]; then
+    if [[ -z "$detected" ]]; then
+      echo "WARNUNG: IP ${IP} konnte nicht an VM ${ID} gebunden werden (keine erkannte IP)." >&2
+    elif [[ "$detected" != "$IP" ]]; then
+      die "IP ${IP} gehört nicht zu VM ${ID} (erkannt: ${detected})."
+    fi
+  else
+    IP="$detected"
   fi
-  [[ -n "$IP" ]] || IP="$detected"
   [[ -n "$IP" ]] || die "IP nicht ermittelbar; bitte als Argument angeben."
 else
   [[ -n "$IP" ]] || IP="$(detect_ip || true)"
@@ -193,9 +207,9 @@ if [[ "${REBOOT_TEST_FORCE:-0}" != "1" ]] && ! is_ours "$IP"; then
 fi
 
 check_all "vorher" "$IP"
-OLD_BOOT="$(run_in "$IP" 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)"
-[[ -n "$OLD_BOOT" ]] || die "Boot-ID vor Reboot nicht lesbar."
-echo "Boot-ID vor Reboot: ${OLD_BOOT}"
+OLD_MARKER="$(boot_marker "$IP" 2>/dev/null || true)"
+[[ -n "$OLD_MARKER" ]] || die "Neustart-Marker vor Reboot nicht lesbar."
+echo "Neustart-Marker vor Reboot: ${OLD_MARKER}"
 
 echo "== Reboot =="
 if [[ "$TYPE" == "lxc" ]]; then
@@ -206,28 +220,29 @@ fi
 
 echo "== Nach dem Reboot =="
 NEW_IP=""
-NEW_BOOT=""
+NEW_MARKER=""
 DEADLINE=$((SECONDS + 600))
 while ((SECONDS < DEADLINE)); do
   detected="$(detect_ip || true)"
   if [[ -n "$detected" ]]; then
     if [[ "$detected" != "$last_notified_ip" ]]; then
-      echo "HINWEIS: IP hat sich geändert: ${IP} -> ${detected}"
+      prev="$last_notified_ip"
+      echo "HINWEIS: IP hat sich geändert: ${prev} -> ${detected}"
       last_notified_ip="$detected"
     fi
     NEW_IP="$detected"
   fi
   probe_ip="${NEW_IP:-$IP}"
-  NEW_BOOT="$(run_in "$probe_ip" 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)"
-  if [[ -n "$NEW_BOOT" && "$NEW_BOOT" != "$OLD_BOOT" ]]; then
+  NEW_MARKER="$(boot_marker "$probe_ip" 2>/dev/null || true)"
+  if [[ -n "$NEW_MARKER" && "$NEW_MARKER" != "$OLD_MARKER" ]]; then
     IP="$probe_ip"
     break
   fi
   if [[ "$TYPE" == "lxc" ]]; then sleep 2; else sleep 5; fi
 done
-[[ -n "$NEW_BOOT" && "$NEW_BOOT" != "$OLD_BOOT" ]] \
-  || die "Reboot nicht nachweisbar: Boot-ID blieb innerhalb von 600s unverändert."
-echo "Boot-ID nach Reboot: ${NEW_BOOT}"
+[[ -n "$NEW_MARKER" && "$NEW_MARKER" != "$OLD_MARKER" ]] \
+  || die "Reboot nicht nachweisbar: Neustart-Marker blieb innerhalb von 600s unverändert."
+echo "Neustart-Marker nach Reboot: ${NEW_MARKER}"
 
 code=""
 DEADLINE=$((SECONDS + 300))
@@ -235,7 +250,8 @@ while ((SECONDS < DEADLINE)); do
   detected="$(detect_ip || true)"
   if [[ -n "$detected" ]]; then
     if [[ "$detected" != "$last_notified_ip" ]]; then
-      echo "HINWEIS: IP hat sich geändert: ${IP} -> ${detected}"
+      prev="$last_notified_ip"
+      echo "HINWEIS: IP hat sich geändert: ${prev} -> ${detected}"
       last_notified_ip="$detected"
     fi
     IP="$detected"

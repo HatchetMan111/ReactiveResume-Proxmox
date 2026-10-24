@@ -38,4 +38,28 @@ grep -Fq "push 999 ${ROOT}/systemd/reactive-resume.service /tmp/reactive-resume-
 grep -Fq -- "--asset-dir /tmp/reactive-resume-assets" "$PCT_LOG" \
   || fail "Innenscript erhielt kein --asset-dir"
 
+: > "$PCT_LOG"
+# shellcheck disable=SC2034 # consumed by run_inner
+MODE="vm"
+# shellcheck disable=SC2034 # consumed by run_inner
+IP="192.0.2.11"
+# shellcheck disable=SC2034 # consumed by run_inner
+CI_USER="ubuntu"
+# shellcheck disable=SC2034 # consumed by run_inner
+SSH_OPTS=()
+scp() { printf '%s\n' "$*" >> "$PCT_LOG"; }
+ssh() { printf '%s\n' "$*" >> "$PCT_LOG"; }
+run_inner
+
+grep -Fq "reactive-resume-inner.sh ubuntu@192.0.2.11:/tmp/reactive-resume-inner.sh" "$PCT_LOG" \
+  || fail "Innenscript wurde nicht in die VM übertragen"
+grep -Fq "mkdir -p '/tmp/reactive-resume-assets'" "$PCT_LOG" \
+  || fail "Asset-Verzeichnis wurde in der VM nicht angelegt"
+grep -Fq "compose.yml ubuntu@192.0.2.11:/tmp/reactive-resume-assets/compose.yml" "$PCT_LOG" \
+  || fail "compose.yml wurde nicht in die VM übertragen"
+grep -Fq "reactive-resume.service ubuntu@192.0.2.11:/tmp/reactive-resume-assets/reactive-resume.service" "$PCT_LOG" \
+  || fail "systemd-Unit wurde nicht in die VM übertragen"
+grep -Fq -- "--asset-dir /tmp/reactive-resume-assets" "$PCT_LOG" \
+  || fail "VM-Innenscript erhielt kein --asset-dir"
+
 printf 'host-assets: PASS\n'

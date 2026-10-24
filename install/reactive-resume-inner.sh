@@ -302,7 +302,7 @@ verify() {
         "http://127.0.0.1:${APP_PORT}/api/health" 2>/dev/null || true)"
       root="$(curl -s -o /dev/null -m 5 -w '%{http_code}' \
         "http://127.0.0.1:${APP_PORT}/" 2>/dev/null || true)"
-      if [[ "$code" == "200" && "$root" =~ ^(200|302)$ ]] \
+      if [[ "$code" == "200" && "$root" =~ ^(200|301|302|303|307|308)$ ]] \
         && grep -Eq '"status"[[:space:]]*:[[:space:]]*"healthy"' /tmp/reactive-resume-health.json; then
         msg_ok "Healthcheck OK (HTTP 200, status healthy); Web-UI HTTP ${root}."
         return 0

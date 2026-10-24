@@ -494,7 +494,7 @@ verify_outer() {
   for ((i = 1; i <= 24; i++)); do
     code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${IP}:${APP_PORT}/api/health" 2>/dev/null || true)"
     root="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${IP}:${APP_PORT}/" 2>/dev/null || true)"
-    if [[ "$code" == "200" && "$root" =~ ^(200|302)$ ]]; then
+    if [[ "$code" == "200" && "$root" =~ ^(200|301|302|303|307|308)$ ]]; then
       msg_ok "Web-UI von außen erreichbar (HTTP ${root}); Health HTTP 200."
       return 0
     fi
@@ -739,6 +739,9 @@ wait_vm_ssh() {
     i=$((i + 1))
     if (( i == 1 || i % 12 == 0 )); then sweep_bridge; fi
     candidate="${STATIC_IP%%/*}"
+    if [[ -n "$candidate" ]] && ! ssh "${SSH_OPTS[@]}" "${CI_USER}@${candidate}" true >/dev/null 2>&1; then
+      candidate=""
+    fi
     if [[ -z "$candidate" ]]; then
       candidate="$(detect_vm_ip 2>/dev/null || true)"
     fi

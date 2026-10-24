@@ -12,11 +12,11 @@ einen reboot-festen systemd-Dienst ein.
 
 ## Voraussetzungen
 
-- Proxmox VE 8.x, Root-SSH auf dem Host
-- Internetzugang des Hosts (Debian-Template, GitHub, Docker Hub)
+- Proxmox VE 8.x, Root-SSH auf dem Host; Debian 13 mit automatischem Fallback auf Debian 12
+- Internetzugang des Hosts (Debian-Template, GitHub, Docker Hub, Ubuntu-Cloud-Image) und des Gasts (apt, get.docker.com, Docker Hub)
 - Linux-Bridge `vmbr0`
-- Storage für `rootdir` (LXC) bzw. `images` (VM)
-- LXC: 2 vCPU / 4 GB / 16 GB; VM: 2 vCPU / 4 GB / 20 GB
+- Storage für `vztmpl` (LXC) bzw. `images` und lokales ISO-Staging (VM)
+- LXC: 2 vCPU / 4 GiB / 16 GiB; VM: 2 vCPU / 4 GiB / 20 GiB
 
 ## Schnellstart
 
@@ -27,7 +27,9 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/ReactiveRe
 ```
 
 Das Script fragt nichts ab, nimmt die kleinste freie ID ab 100 und zeigt am Ende
-ID, IP und URL an.
+ID, IP und URL an. Der Einzeiler lädt das Script von `main`; bei einem
+`curl`-Fehler bricht die Shell ggf. ohne eigene Meldung ab. Für reproduzierbare
+Läufe besser lokal klonen.
 
 Lokal:
 
@@ -44,7 +46,7 @@ sudo bash install/reactive-resume.sh
 --vm                 VM statt LXC
 --hostname NAME      Hostname (Default: reactive-resume)
 --cores N            vCPUs (Default: 2)
---ram MB             RAM in MiB (Default: 4096)
+--ram, --memory MB   RAM in MiB (Default: 4096)
 --disk GB            Disk in GiB (Default: 16 LXC / 20 VM)
 --storage NAME       Proxmox-Storage (Default: automatisch)
 --bridge NAME        Bridge (Default: vmbr0)
@@ -53,8 +55,9 @@ sudo bash install/reactive-resume.sh
 --ip CIDR            statische IP inkl. Präfix
 --gw IP              Gateway (nur mit --ip)
 --ssh-key PATH       privater SSH-Key (nur VM)
---force              fremde ID überschreiben
+--force              fremde/existierende ID in-place übernehmen (kein Neuaufbau)
 --debug              bash -x + erweiterte Diagnose
+-h, --help           diese Hilfe
 ```
 
 Beispiele:
@@ -85,10 +88,21 @@ nie vom Installer verlangt oder geloggt.
 
 ## Update
 
-Erneut mit derselben ID ausführen:
+Aus dem geklonten Repository erneut mit derselben ID ausführen:
 
 ```bash
+# LXC
 bash install/reactive-resume.sh --vmid 105
+
+# VM
+bash install/reactive-resume.sh --vmid 105 --vm
+```
+
+Einzeiler (Argumente nach dem `_`):
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/ReactiveResume-Proxmox/main/install/reactive-resume.sh)" _ --vmid 105
+# VM: ... _ --vmid 105 --vm
 ```
 
 Das Script zieht neue Images, schreibt die Unit neu und startet den Dienst. Die
@@ -114,7 +128,13 @@ Prüft Dienst, Compose, Health und `APP_URL` vor und nach `pct reboot` bzw.
 - DHCP-Reservation im Router.
 
 Manuell: `APP_URL="http://<neue-ip>:3000"` in `/opt/reactive-resume/.env`
-setzen und `docker compose up -d reactive-resume` ausführen.
+setzen und im Projektverzeichnis neu starten:
+
+```bash
+cd /opt/reactive-resume && docker compose up -d reactive-resume
+# oder:
+systemctl restart reactive-resume
+```
 
 ## Troubleshooting
 
@@ -164,6 +184,7 @@ Damit werden auch alle Daten in den Volumes gelöscht.
 - Kein TLS; nur LAN/VPN oder Reverse Proxy davor.
 - PostgreSQL ist nicht nach außen veröffentlicht.
 - `.env` ist `0600`; Docker-Socket-Zugriff ist root-äquivalent.
+- LXC-Root-Zugangsdaten liegen in `/root/reactive-resume-<ID>.creds` (Modus `0600`).
 - OpenRouter-Key nur in der UI, verschlüsselt mit `ENCRYPTION_SECRET`.
 
 ## Projektstruktur
@@ -173,8 +194,12 @@ ReactiveResume-Proxmox/
 ├── install/reactive-resume.sh
 ├── install/reactive-resume-inner.sh
 ├── compose/compose.yml
+├── compose/.env.example
 ├── systemd/reactive-resume.service
 ├── tests/static-checks.sh
+├── tests/inner-functions.sh
+├── tests/host-vm.sh
+├── tests/compose-contract.sh
 ├── tests/reboot-test.sh
 └── README.md
 ```
@@ -182,6 +207,6 @@ ReactiveResume-Proxmox/
 ## Teststatus
 
 `tests/static-checks.sh` läuft ohne Proxmox (Syntax, ShellCheck, Compose,
-Vertrags-Checks, Env-Erhaltung, ID-Vergabe). Der echte Installations- und
-Reboot-Test muss auf einem Proxmox-Host ausgeführt werden; in der
-Entwicklungssandbox fehlen `pct` und `qm`.
+Vertrags-Checks, Env-Erhaltung, ID-Vergabe, `inner-functions`, `host-vm` und
+`compose-contract`). Der echte Installations- und Reboot-Test muss auf einem
+Proxmox-Host ausgeführt werden; in der Entwicklungssandbox fehlen `pct` und `qm`.

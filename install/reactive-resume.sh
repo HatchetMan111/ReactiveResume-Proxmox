@@ -94,7 +94,8 @@ Usage: bash reactive-resume.sh [OPTIONEN]
   --ip CIDR            statische IP inkl. Präfix (z. B. 192.168.1.50/24)
   --gw IP              Gateway (nur mit --ip)
   --ssh-key PATH       privater SSH-Key (nur VM)
-  --force              fremde/existierende ID in-place übernehmen (kein Neuaufbau)
+  --force              fremde/existierende ID in-place übernehmen (kein Neuaufbau);
+                       VM: verwendeter SSH-Key muss im Gast autorisiert sein
   --debug              bash -x + erweiterte Diagnose
   -h, --help           diese Hilfe
 EOF
@@ -738,7 +739,7 @@ main() {
   if ct_exists "$VMID"; then
     [[ "$MODE" == "lxc" ]] || die "ID ${VMID} ist ein LXC; nutze ohne --vm."
     if [[ "$FORCE" != "1" ]] && ! is_ours_ct "$VMID"; then
-      die "ID ${VMID} gehört nicht zu ${APP}. Mit --force überschreiben."
+      die "ID ${VMID} gehört nicht zu ${APP}. Mit --force in-place übernehmen."
     fi
     exists=1
     msg_info "Aktualisiere bestehenden LXC ${VMID} ..."
@@ -746,7 +747,7 @@ main() {
   elif vm_exists "$VMID"; then
     [[ "$MODE" == "vm" ]] || die "ID ${VMID} ist eine VM; nutze --vm."
     if [[ "$FORCE" != "1" ]] && ! is_ours_vm "$VMID"; then
-      die "ID ${VMID} gehört nicht zu ${APP}. Mit --force überschreiben."
+      die "ID ${VMID} gehört nicht zu ${APP}. Mit --force in-place übernehmen."
     fi
     exists=1
     msg_info "Aktualisiere bestehende VM ${VMID} ..."

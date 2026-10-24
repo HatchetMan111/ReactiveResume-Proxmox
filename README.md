@@ -27,9 +27,14 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/ReactiveRe
 ```
 
 Das Script fragt nichts ab, nimmt die kleinste freie ID ab 100 und zeigt am Ende
-ID, IP und URL an. Der Einzeiler lädt das Script von `main`; schlägt `curl`
-fehl, läuft `bash -c ""` leer durch (Exit 0, keine Meldung). Exit-Code prüfen
-oder für reproduzierbare Läufe lokal klonen.
+ID, IP und URL an. Der Einzeiler lädt das Script von `main`. Schlägt `curl`
+fehl, meldet curl den Fehler, aber `bash -c ""` läuft leer durch (Exit 0). Für
+einen geprüften Download:
+
+```bash
+curl -fsSL -o /tmp/reactive-resume.sh https://raw.githubusercontent.com/HatchetMan111/ReactiveResume-Proxmox/main/install/reactive-resume.sh \
+  && sudo bash /tmp/reactive-resume.sh
+```
 
 Lokal:
 
@@ -56,7 +61,7 @@ sudo bash install/reactive-resume.sh
 --gw IP              Gateway (nur mit --ip)
 --ssh-key PATH       privater SSH-Key (nur VM)
 --force              fremde/existierende ID in-place übernehmen (kein Neuaufbau);
-                     VM: angegebener SSH-Key muss im Gast bereits autorisiert sein
+                     VM: verwendeter SSH-Key muss im Gast bereits autorisiert sein
 --debug              bash -x + erweiterte Diagnose
 -h, --help           diese Hilfe
 ```

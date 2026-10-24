@@ -259,6 +259,8 @@ validate_config() {
     command -v ssh >/dev/null 2>&1 || die "ssh nicht gefunden."
     command -v scp >/dev/null 2>&1 || die "scp nicht gefunden."
     command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen nicht gefunden."
+    command -v sha256sum >/dev/null 2>&1 || die "sha256sum nicht gefunden."
+    command -v ping >/dev/null 2>&1 || die "ping nicht gefunden."
   fi
   if [[ -n "$STORAGE" ]]; then
     [[ "$STORAGE" =~ ^[A-Za-z0-9._-]+$ ]] || die "--storage enthält ungültige Zeichen."
@@ -503,14 +505,13 @@ prepare_ssh_key() {
   fi
   grep -q '^ssh-' "$SSH_KEY_PATH" 2>/dev/null && die "--ssh-key erwartet einen privaten Key."
   chmod 600 "$SSH_KEY_PATH"
-  if [[ -f "${SSH_KEY_PATH}.pub" ]]; then
-    SSH_PUB="$(cat "${SSH_KEY_PATH}.pub")"
-  else
-    SSH_PUB="$(ssh-keygen -y -P "" -f "$SSH_KEY_PATH" </dev/null)"
-  fi
-  [[ "$SSH_PUB" == ssh-* ]] || die "Konnte keinen Public Key aus ${SSH_KEY_PATH} lesen."
+  SSH_PUB="$(ssh-keygen -y -P "" -f "$SSH_KEY_PATH" </dev/null)" \
+    || die "Konnte keinen Public Key aus ${SSH_KEY_PATH} lesen (Passphrase?)."
+  [[ "$SSH_PUB" == ssh-* ]] || die "Ungültiger Public Key aus ${SSH_KEY_PATH}."
   SSH_OPTS=(
     -i "$SSH_KEY_PATH"
+    -o IdentitiesOnly=yes
+    -o PreferredAuthentications=publickey
     -o StrictHostKeyChecking=no
     -o UserKnownHostsFile=/dev/null
     -o ConnectTimeout=5
@@ -521,18 +522,32 @@ prepare_ssh_key() {
 }
 
 ensure_cloud_image() {
-  local arch="amd64" codename="noble" name url
+  local arch="amd64" codename="noble" name url sums_url sums expected
   [[ "$(uname -m)" == "aarch64" ]] && arch="arm64"
   name="${codename}-server-cloudimg-${arch}.img"
   url="https://cloud-images.ubuntu.com/${codename}/current/${name}"
   CLOUD_IMAGE="/var/lib/vz/template/iso/${name}"
-  mkdir -p "$(dirname "$CLOUD_IMAGE")"
+  install -d -m 0755 "$(dirname "$CLOUD_IMAGE")"
   if [[ ! -s "$CLOUD_IMAGE" ]]; then
     msg_info "Lade Ubuntu 24.04 Cloud-Image ..."
     rm -f "${CLOUD_IMAGE}.part"
     if ! curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 -o "${CLOUD_IMAGE}.part" "$url"; then
       rm -f "${CLOUD_IMAGE}.part"
       die "Download des Cloud-Images fehlgeschlagen: ${url}"
+    fi
+    sums_url="https://cloud-images.ubuntu.com/${codename}/current/SHA256SUMS"
+    if ! sums="$(curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 20 "$sums_url")"; then
+      rm -f "${CLOUD_IMAGE}.part"
+      die "Download der Prüfsummen fehlgeschlagen: ${sums_url}"
+    fi
+    expected="$(printf '%s\n' "$sums" | awk -v n="$name" '$2 == n || $2 == "*" n {print $1; exit}')"
+    if [[ -z "$expected" ]]; then
+      rm -f "${CLOUD_IMAGE}.part"
+      die "SHA256-Eintrag für ${name} nicht gefunden."
+    fi
+    if ! printf '%s  %s\n' "$expected" "${CLOUD_IMAGE}.part" | sha256sum -c - >/dev/null 2>&1; then
+      rm -f "${CLOUD_IMAGE}.part"
+      die "SHA256-Prüfsumme für ${name} stimmt nicht."
     fi
     mv "${CLOUD_IMAGE}.part" "$CLOUD_IMAGE"
   else
@@ -565,7 +580,10 @@ create_vm() {
     --onboot 1 \
     --description "${APP} – installiert von ${INSTALLER_REPO}"
 
-  import_out="$(qm importdisk "$VMID" "$CLOUD_IMAGE" "$STORAGE" 2>&1)"
+  if ! import_out="$(qm importdisk "$VMID" "$CLOUD_IMAGE" "$STORAGE" 2>&1)"; then
+    printf '%s\n' "$import_out" >&2
+    die "qm importdisk für VM ${VMID} fehlgeschlagen."
+  fi
   printf '%s\n' "$import_out"
   disk="$(qm config "$VMID" | awk -F': ' '/^unused0:/ {print $2}')"
   if [[ -z "$disk" ]]; then
@@ -593,7 +611,19 @@ create_vm() {
 }
 
 update_vm() {
+  qm config "$VMID" | grep -q '^scsi0:' \
+    || die "VM ${VMID} ist unvollständig (kein scsi0). Mit 'qm destroy ${VMID} --purge' neu beginnen."
+  qm config "$VMID" | grep -q '^ide2:.*cloudinit' \
+    || die "VM ${VMID} ist unvollständig (keine Cloud-Init-Disk). Mit 'qm destroy ${VMID} --purge' neu beginnen."
   qm set "$VMID" --onboot 1
+  if [[ -n "$STATIC_IP" ]]; then
+    qm set "$VMID" --ipconfig0 "ip=${STATIC_IP},gw=${GATEWAY}"
+    qm cloudinit update "$VMID" >/dev/null || die "Cloud-Init-Update für ${VMID} fehlgeschlagen."
+    if [[ "$(qm status "$VMID" | awk '{print $2}')" == "running" ]]; then
+      msg_warn "IP-Konfiguration geändert – starte VM neu."
+      qm reboot "$VMID"
+    fi
+  fi
   if [[ "$(qm status "$VMID" | awk '{print $2}')" != "running" ]]; then
     msg_info "Starte bestehende VM ${VMID} ..."
     qm start "$VMID"
@@ -604,7 +634,7 @@ update_vm() {
 is_ours_vm() {
   local cfg
   cfg="$(qm config "$1" 2>/dev/null || true)"
-  grep -Fq -- "${APP} – installiert von" <<< "$cfg" \
+  grep -Fq -- "description: ${APP} – installiert von" <<< "$cfg" \
     || grep -Fxq -- "name: ${CT_HOSTNAME}" <<< "$cfg"
 }
 
@@ -638,35 +668,51 @@ for iface in data:
                 sys.exit(0)
 sys.exit(1)
 ' 2>/dev/null || true)"
-    [[ -n "$ip" ]] && { printf '%s\n' "$ip"; return 0; }
+    if [[ -n "$ip" ]] && is_ipv4 "$ip"; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
   fi
   mac="$(qm config "$VMID" 2>/dev/null | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -n1 || true)"
   if [[ -n "$mac" ]]; then
     ip="$(ip neigh show dev "$BRIDGE" 2>/dev/null | grep -i "$mac" | awk '{print $1}' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | grep -v '^169\.254\.' | head -n1 || true)"
-    [[ -n "$ip" ]] && { printf '%s\n' "$ip"; return 0; }
+    if [[ -n "$ip" ]] && is_ipv4 "$ip"; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
   fi
   return 1
 }
 
 sweep_bridge() {
   local subnet i
-  subnet="$(ip -4 -o addr show dev "$BRIDGE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | cut -d. -f1-3 || true)"
+  local -a pids=()
+  subnet="$(ip -4 -o addr show dev "$BRIDGE" 2>/dev/null | awk 'NR==1 {print $4}' | cut -d/ -f1 | cut -d. -f1-3 || true)"
   [[ "$subnet" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
-  for i in $(seq 1 254); do ping -c1 -W1 "${subnet}.${i}" >/dev/null 2>&1 & done
-  wait 2>/dev/null || true
+  for i in $(seq 1 254); do
+    ping -n -c1 -W1 "${subnet}.${i}" >/dev/null 2>&1 &
+    pids+=("$!")
+  done
+  ((${#pids[@]})) && { wait "${pids[@]}" 2>/dev/null || true; }
+  return 0
 }
 
 wait_vm_ssh() {
-  local i candidate
-  for i in $(seq 1 120); do
+  local deadline=$((SECONDS + 600)) i=0 candidate
+  while (( SECONDS < deadline )); do
+    i=$((i + 1))
     if (( i == 1 || i % 12 == 0 )); then sweep_bridge; fi
     candidate="$(detect_vm_ip 2>/dev/null || true)"
-    [[ -n "$candidate" ]] && WAIT_IP="$candidate"
+    if [[ -n "$candidate" ]]; then
+      WAIT_IP="$candidate"
+    else
+      WAIT_IP=""
+    fi
     if [[ -n "${WAIT_IP:-}" ]] && ssh "${SSH_OPTS[@]}" "${CI_USER}@${WAIT_IP}" true >/dev/null 2>&1; then
       return 0
     fi
     if (( i % 6 == 0 )); then
-      msg_info "  ... warte auf SSH (${i}/120, IP: ${WAIT_IP:-?})"
+      msg_info "  ... warte auf SSH (${i}, ${SECONDS}s/600s, IP: ${WAIT_IP:-?})"
     fi
     sleep 5
   done
@@ -718,7 +764,8 @@ main() {
     wait_for_ip || die "Keine IPv4-Adresse im Container ${VMID} gefunden."
     IP="$WAIT_IP"
   else
-    wait_for_vm_ip || die "Keine IPv4-Adresse in VM ${VMID} gefunden."
+    wait_for_vm_ip \
+      || die "VM ${VMID} nicht per SSH erreichbar (Ziel: ${CI_USER}@<vm-ip>, Key: ${SSH_KEY_PATH})."
     IP="$WAIT_IP"
   fi
   msg_ok "IP: ${IP}"

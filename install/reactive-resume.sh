@@ -94,7 +94,7 @@ Usage: bash reactive-resume.sh [OPTIONEN]
   --ip CIDR            statische IP inkl. Präfix (z. B. 192.168.1.50/24)
   --gw IP              Gateway (nur mit --ip)
   --ssh-key PATH       privater SSH-Key (nur VM)
-  --force              fremde/existierende ID überschreiben
+  --force              fremde/existierende ID in-place übernehmen (kein Neuaufbau)
   --debug              bash -x + erweiterte Diagnose
   -h, --help           diese Hilfe
 EOF

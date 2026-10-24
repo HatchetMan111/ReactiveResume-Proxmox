@@ -13,9 +13,9 @@ einen reboot-festen systemd-Dienst ein.
 ## Voraussetzungen
 
 - Proxmox VE 8.x, Root-SSH auf dem Host; Debian 13 mit automatischem Fallback auf Debian 12
-- Internetzugang des Hosts (Debian-Template, GitHub, Docker Hub, Ubuntu-Cloud-Image) und des Gasts (apt, get.docker.com, Docker Hub)
+- Internetzugang des Hosts (Proxmox-Template-Mirror, GitHub, `cloud-images.ubuntu.com`) und des Gasts (apt-Mirrors, `get.docker.com`/`download.docker.com`, Docker Hub, `raw.githubusercontent.com` für `compose.yml` und systemd-Unit)
 - Linux-Bridge `vmbr0`
-- Storage für `vztmpl` (LXC) bzw. `images` und lokales ISO-Staging (VM)
+- Storage für `rootdir` und `vztmpl` (LXC) bzw. `images` und lokales ISO-Staging (VM)
 - LXC: 2 vCPU / 4 GiB / 16 GiB; VM: 2 vCPU / 4 GiB / 20 GiB
 
 ## Schnellstart
@@ -27,9 +27,9 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/ReactiveRe
 ```
 
 Das Script fragt nichts ab, nimmt die kleinste freie ID ab 100 und zeigt am Ende
-ID, IP und URL an. Der Einzeiler lädt das Script von `main`; bei einem
-`curl`-Fehler bricht die Shell ggf. ohne eigene Meldung ab. Für reproduzierbare
-Läufe besser lokal klonen.
+ID, IP und URL an. Der Einzeiler lädt das Script von `main`; schlägt `curl`
+fehl, läuft `bash -c ""` leer durch (Exit 0, keine Meldung). Exit-Code prüfen
+oder für reproduzierbare Läufe lokal klonen.
 
 Lokal:
 
@@ -55,7 +55,8 @@ sudo bash install/reactive-resume.sh
 --ip CIDR            statische IP inkl. Präfix
 --gw IP              Gateway (nur mit --ip)
 --ssh-key PATH       privater SSH-Key (nur VM)
---force              fremde/existierende ID in-place übernehmen (kein Neuaufbau)
+--force              fremde/existierende ID in-place übernehmen (kein Neuaufbau);
+                     VM: angegebener SSH-Key muss im Gast bereits autorisiert sein
 --debug              bash -x + erweiterte Diagnose
 -h, --help           diese Hilfe
 ```
@@ -184,7 +185,7 @@ Damit werden auch alle Daten in den Volumes gelöscht.
 - Kein TLS; nur LAN/VPN oder Reverse Proxy davor.
 - PostgreSQL ist nicht nach außen veröffentlicht.
 - `.env` ist `0600`; Docker-Socket-Zugriff ist root-äquivalent.
-- LXC-Root-Zugangsdaten liegen in `/root/reactive-resume-<ID>.creds` (Modus `0600`).
+- Bei neu erstellten LXCs liegen die Root-Zugangsdaten in `/root/reactive-resume-<ID>.creds` (Modus `0600`).
 - OpenRouter-Key nur in der UI, verschlüsselt mit `ENCRYPTION_SECRET`.
 
 ## Projektstruktur
@@ -201,12 +202,15 @@ ReactiveResume-Proxmox/
 ├── tests/host-vm.sh
 ├── tests/compose-contract.sh
 ├── tests/reboot-test.sh
+├── docs/superpowers/
+├── .gitignore
 └── README.md
 ```
 
 ## Teststatus
 
-`tests/static-checks.sh` läuft ohne Proxmox (Syntax, ShellCheck, Compose,
-Vertrags-Checks, Env-Erhaltung, ID-Vergabe, `inner-functions`, `host-vm` und
-`compose-contract`). Der echte Installations- und Reboot-Test muss auf einem
-Proxmox-Host ausgeführt werden; in der Entwicklungssandbox fehlen `pct` und `qm`.
+`tests/static-checks.sh` läuft ohne Proxmox (Syntax, Vertrags-Checks,
+Env-Erhaltung, ID-Vergabe, `inner-functions`, `host-vm`). ShellCheck und
+`compose-contract` laufen, soweit `shellcheck` bzw. `docker`/`jq` vorhanden
+sind. Der echte Installations- und Reboot-Test muss auf einem Proxmox-Host
+ausgeführt werden; in der Entwicklungssandbox fehlen `pct` und `qm`.

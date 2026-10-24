@@ -22,7 +22,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== Dateien =="
-FILES=(install/reactive-resume.sh install/reactive-resume-inner.sh systemd/reactive-resume.service compose/compose.yml tests/static-checks.sh tests/inner-functions.sh tests/host-vm.sh tests/compose-contract.sh)
+FILES=(install/reactive-resume.sh install/reactive-resume-inner.sh systemd/reactive-resume.service compose/compose.yml tests/static-checks.sh tests/inner-functions.sh tests/host-vm.sh tests/host-assets.sh tests/compose-contract.sh)
 if [[ -f README.md ]]; then FILES+=(README.md); else echo "[SKIP] README.md folgt in Task 10"; fi
 if [[ -f tests/reboot-test.sh ]]; then FILES+=(tests/reboot-test.sh); else echo "[SKIP] tests/reboot-test.sh folgt in Task 9"; fi
 for f in "${FILES[@]}"; do
@@ -146,6 +146,7 @@ fi
 echo "== Hermetische Tests =="
 check "inner-functions" bash tests/inner-functions.sh
 check "host-vm" bash tests/host-vm.sh
+check "host-assets" bash tests/host-assets.sh
 
 echo "== Ergebnis =="
 if [[ "$FAIL" == "0" ]]; then

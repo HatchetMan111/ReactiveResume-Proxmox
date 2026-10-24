@@ -44,6 +44,11 @@ cd ReactiveResume-Proxmox
 sudo bash install/reactive-resume.sh
 ```
 
+Bei einem lokalen Klon werden `compose/compose.yml` und
+`systemd/reactive-resume.service` aus dem Repo in den Gast übertragen. Der
+Einzeiler lädt dieselben Dateien von `main`; ein lokaler Klon ist daher die
+verlässliche Variante für nicht veröffentlichte Änderungen.
+
 ## Optionen
 
 ```text
@@ -115,14 +120,19 @@ Das Script zieht neue Images, schreibt die Unit neu und startet den Dienst. Die
 Docker-Volumes (Präfix `reactive-resume_`) bleiben erhalten; Secrets in
 `.env` werden nicht neu erzeugt.
 
+Bei bestehenden Gästen werden `--cores`, `--ram` und `--disk` nicht geändert;
+die Ausgabe kennzeichnet die Ressourcen als „bestehend“. `--ip`/`--gw` werden
+nur bei VMs angewendet. Bei einem bestehenden LXC müssen Netzwerkänderungen
+bewusst manuell über `pct set --net0` erfolgen.
+
 ## Reboot-Test
 
 ```bash
 bash tests/reboot-test.sh 105 <IP> 3000
 ```
 
-Prüft Dienst, Compose, Health und `APP_URL` vor und nach `pct reboot` bzw.
-`qm reboot`. Ohne IP wird sie automatisch ermittelt.
+Prüft Dienst, Compose, Health, Web-UI (`/`) und `APP_URL` vor und nach
+`pct reboot` bzw. `qm reboot`. Ohne IP wird sie automatisch ermittelt.
 
 ## Wichtig: APP_URL und DHCP
 
@@ -205,6 +215,7 @@ ReactiveResume-Proxmox/
 ├── tests/static-checks.sh
 ├── tests/inner-functions.sh
 ├── tests/host-vm.sh
+├── tests/host-assets.sh
 ├── tests/compose-contract.sh
 ├── tests/reboot-test.sh
 ├── docs/superpowers/
@@ -215,7 +226,7 @@ ReactiveResume-Proxmox/
 ## Teststatus
 
 `tests/static-checks.sh` läuft ohne Proxmox (Syntax, Vertrags-Checks,
-Env-Erhaltung, ID-Vergabe, `inner-functions`, `host-vm`). ShellCheck und
+Env-Erhaltung, ID-Vergabe, `inner-functions`, `host-vm`, `host-assets`). ShellCheck und
 `compose-contract` laufen, soweit `shellcheck` bzw. `docker`/`jq` vorhanden
 sind. Der echte Installations- und Reboot-Test muss auf einem Proxmox-Host
 ausgeführt werden; in der Entwicklungssandbox fehlen `pct` und `qm`.

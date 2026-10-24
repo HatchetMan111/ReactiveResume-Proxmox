@@ -165,10 +165,20 @@ check_all() {
   printf '%s\n' "$health" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"healthy"' \
     || die "Health-Antwort ohne status=healthy."
 
+  echo "--- ${phase}: Web-UI lokal ---"
+  root="$(run_in "$ip" "curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:${PORT}/" || true)"
+  echo "HTTP ${root}"
+  [[ "$root" =~ ^(200|302)$ ]] || die "Lokale Web-UI lieferte HTTP ${root:-?} statt 200/302."
+
   echo "--- ${phase}: Health von außen (${ip}) ---"
   code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${ip}:${PORT}/api/health" || true)"
   echo "HTTP ${code}"
   [[ "$code" == "200" ]] || die "Externer Health-Check lieferte HTTP ${code:-?} statt 200."
+
+  echo "--- ${phase}: Web-UI von außen (${ip}) ---"
+  root="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${ip}:${PORT}/" || true)"
+  echo "HTTP ${root}"
+  [[ "$root" =~ ^(200|302)$ ]] || die "Externe Web-UI lieferte HTTP ${root:-?} statt 200/302."
 
   echo "--- ${phase}: APP_URL ---"
   app_url="$(run_in "$ip" "grep '^APP_URL=' /opt/reactive-resume/.env" 2>/dev/null)" \

@@ -34,6 +34,11 @@ CI_USER="ubuntu"
 FORCE=0
 # shellcheck disable=SC2034 # consumed by Task 6/7 provisioning
 DEBUG=0
+CORES_SET=0
+RAM_SET=0
+DISK_SET=0
+IP_SET=0
+DIAG_READY=0
 # shellcheck disable=SC2034 # consumed by Task 6/7 provisioning
 IP=""
 # shellcheck disable=SC2034 # consumed by Task 6/7 provisioning
@@ -73,7 +78,14 @@ msg_info()  { printf '%s\n' "${C_BLUE}[INFO]${C_RESET}  $*" >&2; }
 msg_ok()    { printf '%s\n' "${C_GREEN}[OK]${C_RESET}    $*" >&2; }
 msg_warn()  { printf '%s\n' "${C_YELLOW}[WARN]${C_RESET}  $*" >&2; }
 msg_error() { printf '%s\n' "${C_RED}[ERROR]${C_RESET} $*" >&2; }
-die()       { msg_error "$*"; exit 1; }
+die() {
+  local ec=1
+  msg_error "$*"
+  if [[ "${DIAG_READY:-0}" == "1" ]] && declare -F on_error >/dev/null 2>&1; then
+    on_error "${BASH_LINENO[0]:-?}" "die" "$ec"
+  fi
+  exit "$ec"
+}
 
 usage() {
   cat <<EOF
@@ -171,7 +183,7 @@ need_value() {
 }
 
 on_error() {
-  local ec=$? line="$1" cmd="$2"
+  local ec="${3:-$?}" line="${1:-?}" cmd="${2:-?}"
   trap - ERR
   msg_error "FEHLER: »${cmd}« in Zeile ${line} (Exit ${ec})."
   msg_error "Host-Log: ${LOG_FILE}"
@@ -209,9 +221,9 @@ parse_args() {
       --vmid) need_value "$1" "${2:-}"; VMID="$2"; shift 2 ;;
       --vm) MODE="vm"; shift ;;
       --hostname) need_value "$1" "${2:-}"; CT_HOSTNAME="$2"; shift 2 ;;
-      --cores) need_value "$1" "${2:-}"; CORES="$2"; shift 2 ;;
-      --ram|--memory) need_value "$1" "${2:-}"; RAM_MB="$2"; shift 2 ;;
-      --disk) need_value "$1" "${2:-}"; DISK_GB="$2"; shift 2 ;;
+      --cores) need_value "$1" "${2:-}"; CORES="$2"; CORES_SET=1; shift 2 ;;
+      --ram|--memory) need_value "$1" "${2:-}"; RAM_MB="$2"; RAM_SET=1; shift 2 ;;
+      --disk) need_value "$1" "${2:-}"; DISK_GB="$2"; DISK_SET=1; shift 2 ;;
       --storage)
         need_value "$1" "${2:-}"
         # shellcheck disable=SC2034 # consumed by Task 6/7
@@ -221,7 +233,7 @@ parse_args() {
       --bridge) need_value "$1" "${2:-}"; BRIDGE="$2"; shift 2 ;;
       --port) need_value "$1" "${2:-}"; APP_PORT="$2"; shift 2 ;;
       --image) need_value "$1" "${2:-}"; APP_IMAGE="$2"; shift 2 ;;
-      --ip) need_value "$1" "${2:-}"; STATIC_IP="$2"; shift 2 ;;
+      --ip) need_value "$1" "${2:-}"; STATIC_IP="$2"; IP_SET=1; shift 2 ;;
       --gw) need_value "$1" "${2:-}"; GATEWAY="$2"; shift 2 ;;
       --ssh-key)
         need_value "$1" "${2:-}"
@@ -277,6 +289,7 @@ validate_config() {
   is_uint "$CORES" && (( 10#$CORES >= 1 && 10#$CORES <= 128 )) || die "--cores muss 1..128 sein."
   is_uint "$RAM_MB" && (( 10#$RAM_MB >= 1024 )) || die "--ram muss >= 1024 MiB sein."
   is_uint "$APP_PORT" && (( 10#$APP_PORT >= 1 && 10#$APP_PORT <= 65535 )) || die "--port muss 1..65535 sein."
+  APP_PORT=$((10#$APP_PORT))
   [[ ${#CT_HOSTNAME} -le 63 ]] || die "--hostname darf maximal 63 Zeichen haben."
   [[ "$CT_HOSTNAME" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "--hostname ist kein gültiger DNS-Name."
   [[ "$APP_IMAGE" != -* ]] || die "--image darf nicht mit '-' beginnen."
@@ -307,6 +320,7 @@ setup_logging() {
   chmod 600 "$LOG_FILE"
   exec > >(tee -i "$LOG_FILE") 2>&1
   trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
+  DIAG_READY=1
   msg_info "Host-Log: ${LOG_FILE}"
   if [[ "$DEBUG" == "1" ]]; then set -x; fi
 }
@@ -431,7 +445,7 @@ update_lxc() {
 }
 
 run_inner() {
-  local inner
+  local inner asset_dir="" compose_local="" unit_local=""
   local -a args
   if [[ -f "${SCRIPT_DIR}/reactive-resume-inner.sh" ]]; then
     inner="${SCRIPT_DIR}/reactive-resume-inner.sh"
@@ -442,16 +456,32 @@ run_inner() {
     inner="$INNER_TMP"
   fi
   [[ -s "$inner" ]] || die "Innenscript nicht gefunden."
+  if [[ -f "${SCRIPT_DIR}/../compose/compose.yml" && -f "${SCRIPT_DIR}/../systemd/reactive-resume.service" ]]; then
+    compose_local="$(cd -- "${SCRIPT_DIR}/../compose" && pwd)/compose.yml"
+    unit_local="$(cd -- "${SCRIPT_DIR}/../systemd" && pwd)/reactive-resume.service"
+    asset_dir="/tmp/reactive-resume-assets"
+  fi
   args=(--port "$APP_PORT" --app-url "http://${IP}:${APP_PORT}" --app-image "$APP_IMAGE")
-  [[ "$DEBUG" == "1" ]] && args+=(--debug)
+  if [[ -n "$asset_dir" ]]; then args+=(--asset-dir "$asset_dir"); fi
+  if [[ "$DEBUG" == "1" ]]; then args+=(--debug); fi
 
   if [[ "$MODE" == "lxc" ]]; then
     pct push "$VMID" "$inner" /tmp/reactive-resume-inner.sh --perms 700
+    if [[ -n "$asset_dir" ]]; then
+      pct exec "$VMID" -- mkdir -p "$asset_dir"
+      pct push "$VMID" "$compose_local" "${asset_dir}/compose.yml" --perms 644
+      pct push "$VMID" "$unit_local" "${asset_dir}/reactive-resume.service" --perms 644
+    fi
     if ! pct exec "$VMID" -- bash /tmp/reactive-resume-inner.sh "${args[@]}"; then
       die "Innenscript ist fehlgeschlagen (siehe Diagnose oben)."
     fi
   else
     scp "${SSH_OPTS[@]}" "$inner" "${CI_USER}@${IP}:/tmp/reactive-resume-inner.sh"
+    if [[ -n "$asset_dir" ]]; then
+      ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" "mkdir -p '${asset_dir}'"
+      scp "${SSH_OPTS[@]}" "$compose_local" "${CI_USER}@${IP}:${asset_dir}/compose.yml"
+      scp "${SSH_OPTS[@]}" "$unit_local" "${CI_USER}@${IP}:${asset_dir}/reactive-resume.service"
+    fi
     # shellcheck disable=SC2029 # args are shell-quoted here and expanded client-side by design
     if ! ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" "sudo bash /tmp/reactive-resume-inner.sh $(printf '%q ' "${args[@]}")"; then
       die "Innenscript ist fehlgeschlagen (siehe Diagnose oben)."
@@ -460,16 +490,17 @@ run_inner() {
 }
 
 verify_outer() {
-  local i code
+  local i code root
   for ((i = 1; i <= 24; i++)); do
     code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${IP}:${APP_PORT}/api/health" 2>/dev/null || true)"
-    if [[ "$code" == "200" ]]; then
-      msg_ok "Web-UI von außen erreichbar (HTTP 200)."
+    root="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${IP}:${APP_PORT}/" 2>/dev/null || true)"
+    if [[ "$code" == "200" && "$root" =~ ^(200|302)$ ]]; then
+      msg_ok "Web-UI von außen erreichbar (HTTP ${root}); Health HTTP 200."
       return 0
     fi
     sleep 5
   done
-  msg_error "Web-UI von außen nicht erreichbar (letzter HTTP-Code: ${code:-000})."
+  msg_error "Web-UI von außen nicht erreichbar (Health: ${code:-000}, Web-UI: ${root:-000})."
   return 1
 }
 
@@ -479,7 +510,11 @@ summary() {
   echo "  Typ         : $([[ "$MODE" == "lxc" ]] && echo LXC || echo VM)"
   echo "  ID          : ${VMID}"
   echo "  Hostname    : ${CT_HOSTNAME}"
-  echo "  Ressourcen  : ${CORES} vCPU / ${RAM_MB} MiB RAM / ${DISK_GB} GiB Disk"
+  if [[ "${exists:-0}" == "1" ]]; then
+    echo "  Ressourcen  : bestehend (Optionen nur bei Neuanlage)"
+  else
+    echo "  Ressourcen  : ${CORES} vCPU / ${RAM_MB} MiB RAM / ${DISK_GB} GiB Disk"
+  fi
   echo "  IP          : ${IP}"
   echo "  Web UI      : http://${IP}:${APP_PORT}/"
   echo "  Health      : http://${IP}:${APP_PORT}/api/health"
@@ -703,7 +738,10 @@ wait_vm_ssh() {
   while (( SECONDS < deadline )); do
     i=$((i + 1))
     if (( i == 1 || i % 12 == 0 )); then sweep_bridge; fi
-    candidate="$(detect_vm_ip 2>/dev/null || true)"
+    candidate="${STATIC_IP%%/*}"
+    if [[ -z "$candidate" ]]; then
+      candidate="$(detect_vm_ip 2>/dev/null || true)"
+    fi
     if [[ -n "$candidate" ]]; then
       WAIT_IP="$candidate"
     else
@@ -758,6 +796,15 @@ main() {
       create_lxc
     else
       create_vm
+    fi
+  fi
+
+  if [[ "$exists" == "1" ]]; then
+    if (( CORES_SET || RAM_SET || DISK_SET )); then
+      msg_warn "--cores/--ram/--disk werden bei bestehenden Gästen nicht geändert."
+    fi
+    if [[ "$MODE" == "lxc" && "$IP_SET" == "1" ]]; then
+      msg_warn "--ip/--gw werden bei bestehenden LXCs nicht angewendet; nutze 'pct set --net0' manuell."
     fi
   fi
 

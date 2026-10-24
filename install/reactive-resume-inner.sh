@@ -14,7 +14,9 @@ APP_URL=""
 APP_IMAGE="amruthpillai/reactive-resume:latest"
 LOG_FILE="/var/log/reactive-resume-install.log"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+ASSET_DIR=""
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/HatchetMan111/ReactiveResume-Proxmox/main}"
+DIAG_READY=0
 # DEBUG and SCRIPT_DIR are consumed by Task 4 (CLI parsing and asset lookup).
 # shellcheck disable=SC2034
 DEBUG=0
@@ -34,7 +36,14 @@ msg_info()  { echo -e "${C_BLUE}[INFO]${C_RESET}  $*"; }
 msg_ok()    { echo -e "${C_GREEN}[OK]${C_RESET}    $*"; }
 msg_warn()  { echo -e "${C_YELLOW}[WARN]${C_RESET}  $*"; }
 msg_error() { echo -e "${C_RED}[ERROR]${C_RESET} $*" >&2; }
-die()       { msg_error "$*"; exit 1; }
+die() {
+  local ec=1
+  msg_error "$*"
+  if [[ "${DIAG_READY:-0}" == "1" ]] && declare -F on_error >/dev/null 2>&1; then
+    on_error "${BASH_LINENO[0]:-?}" "die" "$ec"
+  fi
+  exit "$ec"
+}
 
 usage() {
   cat <<EOF
@@ -46,6 +55,7 @@ Usage: bash reactive-resume-inner.sh [OPTIONEN]
   --app-url URL       Öffentliche URL (Default: http://<erkannte-IP>:<port>)
   --app-image REF     App-Image inkl. Tag (Default: ${APP_IMAGE})
   --app-dir PATH      Installationsverzeichnis (Default: ${APP_DIR})
+  --asset-dir PATH    Verzeichnis mit compose.yml und systemd-Unit
   --debug             bash -x aktivieren
   -h, --help          diese Hilfe
 EOF
@@ -55,8 +65,8 @@ is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
 normalize_port() {
   local p="${1:-}"
-  is_uint "$p" && (( p >= 1 && p <= 65535 )) || die "Ungültiger Port: ${p}"
-  printf '%s\n' "$p"
+  is_uint "$p" && (( 10#$p >= 1 && 10#$p <= 65535 )) || die "Ungültiger Port: ${p}"
+  printf '%s\n' "$((10#$p))"
 }
 
 detect_ip() {
@@ -157,7 +167,7 @@ redact_env() {
 }
 
 on_error() {
-  local ec=$? line="${1:-?}" cmd="${2:-?}"
+  local ec="${3:-$?}" line="${1:-?}" cmd="${2:-?}"
   trap - ERR
   msg_error "FEHLER: »${cmd}« in Zeile ${line} (Exit ${ec})."
   msg_error "Installer-Log: ${LOG_FILE}"
@@ -190,13 +200,35 @@ install_docker() {
 }
 
 install_compose_file() {
-  local dst="${APP_DIR}/compose.yml"
-  if [[ -f "${SCRIPT_DIR}/../compose/compose.yml" ]]; then
-    install -m 0644 "${SCRIPT_DIR}/../compose/compose.yml" "$dst"
-  else
-    curl -fsSL --retry 3 -o "$dst" "${RAW_BASE}/compose/compose.yml"
+  local dst="${APP_DIR}/compose.yml" src="" tmp
+  tmp="$(mktemp "${dst}.XXXXXX")" \
+    || die "Temporäre compose.yml konnte nicht erstellt werden."
+  if [[ -n "$ASSET_DIR" && -s "${ASSET_DIR}/compose.yml" ]]; then
+    src="${ASSET_DIR}/compose.yml"
+  elif [[ -s "${SCRIPT_DIR}/../compose/compose.yml" ]]; then
+    src="${SCRIPT_DIR}/../compose/compose.yml"
   fi
-  [[ -s "$dst" ]] || die "compose.yml konnte nicht installiert werden."
+  if [[ -n "$src" ]]; then
+    if ! cp "$src" "$tmp"; then
+      rm -f "$tmp"
+      die "compose.yml konnte nicht aus ${src} kopiert werden."
+    fi
+  elif ! curl -fsSL --retry 3 -o "$tmp" "${RAW_BASE}/compose/compose.yml"; then
+    rm -f "$tmp"
+    die "compose.yml konnte nicht geladen werden."
+  fi
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    die "compose.yml ist leer."
+  fi
+  if ! ( cd "$APP_DIR" && docker compose -f "$tmp" config -q ); then
+    rm -f "$tmp"
+    die "compose.yml ist ungültig."
+  fi
+  if ! chmod 0644 "$tmp" || ! mv -f "$tmp" "$dst"; then
+    rm -f "$tmp"
+    die "compose.yml konnte nicht installiert werden."
+  fi
 }
 
 cleanup_unit_stage() {
@@ -206,9 +238,14 @@ cleanup_unit_stage() {
 }
 
 install_unit() {
-  local src="${SCRIPT_DIR}/../systemd/reactive-resume.service"
+  local src=""
   local unit="${UNIT_DIR}/${APP_ID}.service" tmp new dir verify_out
   mkdir -p "$UNIT_DIR" || die "Verzeichnis ${UNIT_DIR} konnte nicht erstellt werden."
+  if [[ -n "$ASSET_DIR" && -s "${ASSET_DIR}/reactive-resume.service" ]]; then
+    src="${ASSET_DIR}/reactive-resume.service"
+  else
+    src="${SCRIPT_DIR}/../systemd/reactive-resume.service"
+  fi
   if [[ -f "$src" ]]; then
     tmp="$src"
   else
@@ -258,19 +295,22 @@ install_unit() {
 }
 
 verify() {
-  local code
+  local code root
   for _ in $(seq 1 90); do
     if systemctl is-active --quiet "$APP_ID"; then
       code="$(curl -s -o /tmp/reactive-resume-health.json -m 5 -w '%{http_code}' \
         "http://127.0.0.1:${APP_PORT}/api/health" 2>/dev/null || true)"
-      if [[ "$code" == "200" ]] && grep -Eq '"status"[[:space:]]*:[[:space:]]*"healthy"' /tmp/reactive-resume-health.json; then
-        msg_ok "Healthcheck OK (HTTP 200, status healthy)."
+      root="$(curl -s -o /dev/null -m 5 -w '%{http_code}' \
+        "http://127.0.0.1:${APP_PORT}/" 2>/dev/null || true)"
+      if [[ "$code" == "200" && "$root" =~ ^(200|302)$ ]] \
+        && grep -Eq '"status"[[:space:]]*:[[:space:]]*"healthy"' /tmp/reactive-resume-health.json; then
+        msg_ok "Healthcheck OK (HTTP 200, status healthy); Web-UI HTTP ${root}."
         return 0
       fi
     fi
     sleep 2
   done
-  die "Healthcheck fehlgeschlagen (letzter HTTP-Code: ${code:-000}); Dienststatus: $(systemctl is-active "$APP_ID" 2>/dev/null || true)."
+  die "Healthcheck fehlgeschlagen (Health: ${code:-000}, Web-UI: ${root:-000}); Dienststatus: $(systemctl is-active "$APP_ID" 2>/dev/null || true)."
 }
 
 main() {
@@ -280,6 +320,7 @@ main() {
       --app-url) APP_URL="$2"; shift 2 ;;
       --app-image) APP_IMAGE="$2"; shift 2 ;;
       --app-dir) APP_DIR="$2"; shift 2 ;;
+      --asset-dir) ASSET_DIR="$2"; shift 2 ;;
       --debug) DEBUG=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "Unbekannte Option: $1" ;;
@@ -295,6 +336,7 @@ main() {
   chmod 600 "$LOG_FILE"
   exec > >(tee -i "$LOG_FILE") 2>&1
   trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
+  DIAG_READY=1
   if [[ "$DEBUG" == "1" ]]; then set -x; fi
 
   if [[ -z "$APP_URL" ]]; then

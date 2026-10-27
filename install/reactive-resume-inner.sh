@@ -169,7 +169,9 @@ redact_env() {
 on_error() {
   local ec="${3:-$?}" line="${1:-?}" cmd="${2:-?}"
   trap - ERR
-  msg_error "FEHLER: »${cmd}« in Zeile ${line} (Exit ${ec})."
+  if [[ "$cmd" != "die" ]]; then
+    msg_error "FEHLER: »${cmd}« in Zeile ${line} (Exit ${ec})."
+  fi
   msg_error "Installer-Log: ${LOG_FILE}"
   echo "--- docker compose ps ---" >&2
   ( cd "$APP_DIR" 2>/dev/null && docker compose ps 2>&1 || true ) >&2
@@ -345,6 +347,11 @@ main() {
   APP_URL="$(normalize_app_url "$APP_URL")"
   msg_info "APP_URL: ${APP_URL}"
   msg_info "APP_IMAGE: ${APP_IMAGE}"
+  if ! getent hosts deb.debian.org >/dev/null 2>&1; then
+    local ns
+    ns="$(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | tr '\n' ' ' || true)"
+    die "DNS-Auflösung fehlgeschlagen (Nameserver: ${ns:-unbekannt}). Installer auf dem Host mit --nameserver <DNS> erneut ausführen."
+  fi
 
   install_docker
   mkdir -p "$APP_DIR"

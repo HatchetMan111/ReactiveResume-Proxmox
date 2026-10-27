@@ -43,6 +43,8 @@ DIAG_READY=0
 IP=""
 # shellcheck disable=SC2034 # consumed by Task 6/7 provisioning
 WAIT_IP=""
+NAMESERVERS=""
+NAMESERVER_OPT=""
 # shellcheck disable=SC2034 # consumed by Task 6/7 provisioning
 ROOT_PW=""
 # shellcheck disable=SC2034 # consumed by Task 6/7 provisioning
@@ -105,6 +107,7 @@ Usage: bash reactive-resume.sh [OPTIONEN]
   --image REF          App-Image inkl. Tag (Default: ${APP_IMAGE})
   --ip CIDR            statische IP inkl. Präfix (z. B. 192.168.1.50/24)
   --gw IP              Gateway (nur mit --ip)
+  --nameserver "IP..." DNS-Server für den Gast (Default: Host-DNS)
   --ssh-key PATH       privater SSH-Key (nur VM)
   --force              fremde/existierende ID in-place übernehmen (kein Neuaufbau);
                        VM: verwendeter SSH-Key muss im Gast autorisiert sein
@@ -124,6 +127,39 @@ is_ipv4() {
     (( 10#$o <= 255 )) || return 1
   done
   return 0
+}
+
+detect_nameservers() {
+  local key addr ns=()
+  local resolv="${RESOLV_CONF:-/etc/resolv.conf}"
+  if [[ -r "$resolv" ]]; then
+    while read -r key addr _; do
+      [[ "$key" == "nameserver" && -n "$addr" ]] || continue
+      is_ipv4 "$addr" || continue
+      [[ "$addr" == 127.* ]] && continue
+      case " ${ns[*]} " in *" $addr "*) continue ;; esac
+      ns+=("$addr")
+    done < "$resolv"
+  fi
+  local systemd_resolv="${SYSTEMD_RESOLV_CONF:-/run/systemd/resolve/resolv.conf}"
+  if (( ${#ns[@]} == 0 )) && [[ -r "$systemd_resolv" ]]; then
+    while read -r key addr _; do
+      [[ "$key" == "nameserver" && -n "$addr" ]] || continue
+      is_ipv4 "$addr" || continue
+      [[ "$addr" == 127.* ]] && continue
+      case " ${ns[*]} " in *" $addr "*) continue ;; esac
+      ns+=("$addr")
+    done < "$systemd_resolv"
+  fi
+  if (( ${#ns[@]} == 0 )); then
+    addr="${GATEWAY:-}"
+    if ! is_ipv4 "$addr"; then
+      addr="$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $3}')"
+    fi
+    if is_ipv4 "${addr:-}"; then ns+=("$addr"); fi
+  fi
+  if (( ${#ns[@]} == 0 )); then ns=(1.1.1.1); fi
+  printf '%s ' "${ns[@]}"
 }
 
 ct_exists() { pct status "$1" >/dev/null 2>&1; }
@@ -185,7 +221,9 @@ need_value() {
 on_error() {
   local ec="${3:-$?}" line="${1:-?}" cmd="${2:-?}"
   trap - ERR
-  msg_error "FEHLER: »${cmd}« in Zeile ${line} (Exit ${ec})."
+  if [[ "$cmd" != "die" ]]; then
+    msg_error "FEHLER: »${cmd}« in Zeile ${line} (Exit ${ec})."
+  fi
   msg_error "Host-Log: ${LOG_FILE}"
   if [[ -n "${VMID:-}" ]]; then
     if ct_exists "$VMID"; then
@@ -235,6 +273,7 @@ parse_args() {
       --image) need_value "$1" "${2:-}"; APP_IMAGE="$2"; shift 2 ;;
       --ip) need_value "$1" "${2:-}"; STATIC_IP="$2"; IP_SET=1; shift 2 ;;
       --gw) need_value "$1" "${2:-}"; GATEWAY="$2"; shift 2 ;;
+      --nameserver) need_value "$1" "${2:-}"; NAMESERVER_OPT="$2"; shift 2 ;;
       --ssh-key)
         need_value "$1" "${2:-}"
         # shellcheck disable=SC2034 # consumed by Task 6/7
@@ -310,6 +349,16 @@ validate_config() {
     is_ipv4 "$ip_part" || die "--ip enthält keine gültige IPv4-Adresse (Oktette 0..255)."
     is_uint "$prefix" && (( 10#$prefix <= 32 )) || die "--ip Präfix muss 0..32 sein."
     is_ipv4 "$GATEWAY" || die "--gw enthält keine gültige IPv4-Adresse (Oktette 0..255)."
+  fi
+  if [[ -n "$NAMESERVER_OPT" ]]; then
+    local ns
+    local -a ns_list=()
+    read -r -a ns_list <<< "$NAMESERVER_OPT"
+    (( ${#ns_list[@]} )) || die "--nameserver benötigt mindestens eine IPv4-Adresse."
+    for ns in "${ns_list[@]}"; do
+      is_ipv4 "$ns" || die "--nameserver enthält keine gültige IPv4-Adresse: ${ns}"
+    done
+    NAMESERVER_OPT="${ns_list[*]}"
   fi
 }
 
@@ -397,7 +446,7 @@ create_lxc() {
     --cores "$CORES" --memory "$RAM_MB" --swap 512 \
     --rootfs "${STORAGE}:${DISK_GB}" \
     --net0 "name=eth0,bridge=${BRIDGE},${net},firewall=0" \
-    --nameserver 1.1.1.1 \
+    --nameserver "$NAMESERVERS" \
     --features nesting=1,keyctl=1 \
     --unprivileged 1 --onboot 1 \
     --description "${APP} – installiert von ${INSTALLER_REPO}"
@@ -639,7 +688,7 @@ create_vm() {
   qm set "$VMID" --sshkeys "$SSH_KEYS_TMP"
   rm -f "$SSH_KEYS_TMP"; SSH_KEYS_TMP=""
   qm set "$VMID" --ipconfig0 "$net"
-  qm set "$VMID" --nameserver "1.1.1.1 9.9.9.9"
+  qm set "$VMID" --nameserver "$NAMESERVERS"
   qm set "$VMID" --ciupgrade 0
 
   qm start "$VMID"
@@ -772,6 +821,60 @@ wait_for_vm_ip() {
   wait_vm_ssh
 }
 
+guest_resolves_dns() {
+  if [[ "$MODE" == "lxc" ]]; then
+    pct exec "$VMID" -- getent hosts deb.debian.org >/dev/null 2>&1
+  else
+    ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" 'getent hosts deb.debian.org' >/dev/null 2>&1
+  fi
+}
+
+guest_resolves_dns_retry() {
+  local i
+  for i in 1 2 3; do
+    guest_resolves_dns && return 0
+    (( i < 3 )) && sleep 2
+  done
+  return 1
+}
+
+apply_vm_dns() {
+  if ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" 'command -v resolvectl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved'; then
+    printf '[Resolve]\nDNS=%s\n' "$NAMESERVERS" \
+      | ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" \
+        'sudo mkdir -p /etc/systemd/resolved.conf.d && sudo tee /etc/systemd/resolved.conf.d/99-reactive-resume.conf >/dev/null && sudo systemctl restart systemd-resolved'
+  else
+    printf 'nameserver %s\n' $NAMESERVERS \
+      | ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" 'sudo tee /etc/resolv.conf >/dev/null'
+  fi
+}
+
+ensure_guest_dns() {
+  [[ -n "$NAMESERVERS" ]] || return 0
+  if [[ -z "$NAMESERVER_OPT" ]]; then
+    guest_resolves_dns_retry && return 0
+    msg_warn "DNS-Auflösung im Gast fehlgeschlagen; setze Nameserver: ${NAMESERVERS}"
+  else
+    msg_info "Setze DNS explizit: ${NAMESERVERS}"
+  fi
+  if [[ "$MODE" == "lxc" ]]; then
+    if ! pct set "$VMID" --nameserver "$NAMESERVERS"; then
+      msg_warn "Nameserver konnte nicht dauerhaft in der CT-Config gesetzt werden."
+    fi
+    # shellcheck disable=SC2086 # nameservers are validated IPv4 addresses
+    if ! printf 'nameserver %s\n' $NAMESERVERS | pct exec "$VMID" -- sh -c 'cat > /etc/resolv.conf'; then
+      die "resolv.conf im Container konnte nicht geschrieben werden."
+    fi
+  else
+    if ! qm set "$VMID" --nameserver "$NAMESERVERS"; then
+      msg_warn "Nameserver konnte nicht dauerhaft in der VM-Config gesetzt werden."
+    fi
+    apply_vm_dns || die "DNS-Konfiguration in der VM konnte nicht geschrieben werden."
+  fi
+  guest_resolves_dns_retry || die "DNS-Auflösung im Gast weiterhin fehlgeschlagen (Nameserver: ${NAMESERVERS})."
+  msg_ok "DNS im Gast korrigiert (${NAMESERVERS})."
+}
+
 main() {
   local exists=0
   parse_args "$@"
@@ -782,7 +885,14 @@ main() {
   if [[ -z "$VMID" ]]; then
     VMID="$(next_free_id)"
   fi
+  if [[ -n "$NAMESERVER_OPT" ]]; then
+    NAMESERVERS="$NAMESERVER_OPT"
+  else
+    NAMESERVERS="$(detect_nameservers)"
+    NAMESERVERS="${NAMESERVERS% }"
+  fi
   msg_info "Ziel-ID: ${VMID} (Modus: ${MODE})"
+  msg_info "DNS: ${NAMESERVERS}"
 
   if ct_exists "$VMID"; then
     [[ "$MODE" == "lxc" ]] || die "ID ${VMID} ist ein LXC; nutze ohne --vm."
@@ -827,6 +937,7 @@ main() {
     IP="$WAIT_IP"
   fi
   msg_ok "IP: ${IP}"
+  ensure_guest_dns
 
   run_inner
   verify_outer || die "Verifikation von außen fehlgeschlagen."

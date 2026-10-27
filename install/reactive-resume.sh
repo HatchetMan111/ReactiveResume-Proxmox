@@ -734,13 +734,18 @@ sweep_bridge() {
 }
 
 wait_vm_ssh() {
-  local deadline=$((SECONDS + 600)) i=0 candidate
+  local deadline=$((SECONDS + 600)) i=0 candidate probed=0
   while (( SECONDS < deadline )); do
     i=$((i + 1))
     if (( i == 1 || i % 12 == 0 )); then sweep_bridge; fi
     candidate="${STATIC_IP%%/*}"
-    if [[ -n "$candidate" ]] && ! ssh "${SSH_OPTS[@]}" "${CI_USER}@${candidate}" true >/dev/null 2>&1; then
-      candidate=""
+    probed=0
+    if [[ -n "$candidate" ]]; then
+      if ssh "${SSH_OPTS[@]}" "${CI_USER}@${candidate}" true >/dev/null 2>&1; then
+        probed=1
+      else
+        candidate=""
+      fi
     fi
     if [[ -z "$candidate" ]]; then
       candidate="$(detect_vm_ip 2>/dev/null || true)"
@@ -750,8 +755,10 @@ wait_vm_ssh() {
     else
       WAIT_IP=""
     fi
-    if [[ -n "${WAIT_IP:-}" ]] && ssh "${SSH_OPTS[@]}" "${CI_USER}@${WAIT_IP}" true >/dev/null 2>&1; then
-      return 0
+    if [[ -n "${WAIT_IP:-}" ]]; then
+      if (( probed )) || ssh "${SSH_OPTS[@]}" "${CI_USER}@${WAIT_IP}" true >/dev/null 2>&1; then
+        return 0
+      fi
     fi
     if (( i % 6 == 0 )); then
       msg_info "  ... warte auf SSH (${i}, ${SECONDS}s/600s, IP: ${WAIT_IP:-?})"

@@ -168,7 +168,7 @@ check_all() {
   echo "--- ${phase}: Web-UI lokal ---"
   root="$(run_in "$ip" "curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:${PORT}/" || true)"
   echo "HTTP ${root}"
-  [[ "$root" =~ ^(200|301|302|303|307|308)$ ]] || die "Lokale Web-UI lieferte HTTP ${root:-?} statt 200/302."
+  [[ "$root" =~ ^(200|301|302|303|307|308)$ ]] || die "Lokale Web-UI lieferte HTTP ${root:-?} statt 2xx/3xx."
 
   echo "--- ${phase}: Health von außen (${ip}) ---"
   code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${ip}:${PORT}/api/health" || true)"
@@ -178,7 +178,7 @@ check_all() {
   echo "--- ${phase}: Web-UI von außen (${ip}) ---"
   root="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${ip}:${PORT}/" || true)"
   echo "HTTP ${root}"
-  [[ "$root" =~ ^(200|301|302|303|307|308)$ ]] || die "Externe Web-UI lieferte HTTP ${root:-?} statt 200/302."
+  [[ "$root" =~ ^(200|301|302|303|307|308)$ ]] || die "Externe Web-UI lieferte HTTP ${root:-?} statt 2xx/3xx."
 
   echo "--- ${phase}: APP_URL ---"
   app_url="$(run_in "$ip" "grep '^APP_URL=' /opt/reactive-resume/.env" 2>/dev/null)" \

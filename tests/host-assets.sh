@@ -53,12 +53,14 @@ run_inner
 
 grep -Fq "reactive-resume-inner.sh ubuntu@192.0.2.11:/tmp/reactive-resume-inner.sh" "$PCT_LOG" \
   || fail "Innenscript wurde nicht in die VM übertragen"
-grep -Fq "mkdir -p '/tmp/reactive-resume-assets'" "$PCT_LOG" \
-  || fail "Asset-Verzeichnis wurde in der VM nicht angelegt"
-grep -Fq "compose.yml ubuntu@192.0.2.11:/tmp/reactive-resume-assets/compose.yml" "$PCT_LOG" \
-  || fail "compose.yml wurde nicht in die VM übertragen"
-grep -Fq "reactive-resume.service ubuntu@192.0.2.11:/tmp/reactive-resume-assets/reactive-resume.service" "$PCT_LOG" \
-  || fail "systemd-Unit wurde nicht in die VM übertragen"
+mkdir_line="$(grep -nF "mkdir -p '/tmp/reactive-resume-assets'" "$PCT_LOG" | cut -d: -f1)"
+compose_line="$(grep -nF "compose.yml ubuntu@192.0.2.11:/tmp/reactive-resume-assets/compose.yml" "$PCT_LOG" | cut -d: -f1)"
+unit_line="$(grep -nF "reactive-resume.service ubuntu@192.0.2.11:/tmp/reactive-resume-assets/reactive-resume.service" "$PCT_LOG" | cut -d: -f1)"
+[[ -n "$mkdir_line" ]] || fail "Asset-Verzeichnis wurde in der VM nicht angelegt"
+[[ -n "$compose_line" ]] || fail "compose.yml wurde nicht in die VM übertragen"
+[[ -n "$unit_line" ]] || fail "systemd-Unit wurde nicht in die VM übertragen"
+(( mkdir_line < compose_line && mkdir_line < unit_line )) \
+  || fail "Asset-Verzeichnis wurde erst nach den Asset-Transfers angelegt"
 grep -Fq -- "--asset-dir /tmp/reactive-resume-assets" "$PCT_LOG" \
   || fail "VM-Innenscript erhielt kein --asset-dir"
 

@@ -165,13 +165,44 @@ detect_nameservers() {
 ct_exists() { pct status "$1" >/dev/null 2>&1; }
 vm_exists() { qm status "$1" >/dev/null 2>&1; }
 
+id_in_use() {
+  local id="$1"
+  ct_exists "$id" || vm_exists "$id" \
+    || pct list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$id" \
+    || qm list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$id"
+}
+
 next_free_id() {
-  local id=100
+  local id=100 used listed=0
+  local -A ids=()
+  while read -r used; do
+    [[ -n "$used" ]] || continue
+    ids["$used"]=1
+    listed=1
+  done < <(pct list 2>/dev/null | awk 'NR>1 {print $1}'; qm list 2>/dev/null | awk 'NR>1 {print $1}')
+  if (( listed )); then
+    while [[ -n "${ids[$id]:-}" ]]; do
+      id=$((id + 1))
+      (( id <= 999999999 )) || die "Keine freie ID im Bereich 100..999999999 gefunden."
+    done
+    printf '%s\n' "$id"
+    return 0
+  fi
   while ct_exists "$id" || vm_exists "$id"; do
     id=$((id + 1))
     (( id <= 999999999 )) || die "Keine freie ID im Bereich 100..999999999 gefunden."
   done
   printf '%s\n' "$id"
+}
+
+ensure_free_vmid() {
+  local guard=0
+  while id_in_use "$VMID"; do
+    (( guard++ < 20 )) || die "Keine freie ID gefunden; bitte --vmid explizit setzen."
+    local old="$VMID"
+    VMID="$(next_free_id)"
+    msg_warn "ID ${old} ist inzwischen belegt – versuche ${VMID}."
+  done
 }
 
 pick_storage() {
@@ -959,6 +990,7 @@ main() {
     msg_info "Aktualisiere bestehende VM ${VMID} ..."
     update_vm
   else
+    ensure_free_vmid
     ensure_unique_name
     if [[ "$MODE" == "lxc" ]]; then
       create_lxc

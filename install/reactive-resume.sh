@@ -532,7 +532,7 @@ run_inner() {
   else
     INNER_TMP="$(mktemp)"
     msg_info "Lade Innenscript aus ${RAW_BASE} ..."
-    curl -fsSL --retry 3 -o "$INNER_TMP" "${RAW_BASE}/install/reactive-resume-inner.sh"
+    curl -fsSL --retry 3 -o "$INNER_TMP" "${RAW_BASE}/install/reactive-resume-inner.sh?v=$(date +%s)"
     inner="$INNER_TMP"
   fi
   [[ -s "$inner" ]] || die "Innenscript nicht gefunden."

@@ -173,6 +173,13 @@ on_error() {
     msg_error "FEHLER: »${cmd}« in Zeile ${line} (Exit ${ec})."
   fi
   msg_error "Installer-Log: ${LOG_FILE}"
+  echo "--- DNS-Diagnose ---" >&2
+  ls -l /etc/resolv.conf 2>&1 || true
+  cat /etc/resolv.conf 2>&1 || true
+  grep '^hosts' /etc/nsswitch.conf 2>/dev/null || true
+  getent hosts deb.debian.org 2>&1 || true
+  su -s /bin/sh _apt -c 'getent hosts deb.debian.org' 2>&1 || true
+  ip -4 route 2>&1 || true
   echo "--- docker compose ps ---" >&2
   ( cd "$APP_DIR" 2>/dev/null && docker compose ps 2>&1 || true ) >&2
   echo "--- docker compose logs (tail 200) ---" >&2
@@ -218,7 +225,7 @@ install_compose_file() {
       rm -f "$tmp"
       die "compose.yml konnte nicht aus ${src} kopiert werden."
     fi
-  elif ! curl -fsSL --retry 3 -o "$tmp" "${RAW_BASE}/compose/compose.yml"; then
+  elif ! curl -fsSL --retry 3 -o "$tmp" "${RAW_BASE}/compose/compose.yml?v=$(date +%s)"; then
     rm -f "$tmp"
     die "compose.yml konnte nicht geladen werden."
   fi
@@ -255,7 +262,7 @@ install_unit() {
     tmp="$src"
   else
     tmp="$(mktemp)"
-    if ! curl -fsSL --retry 3 -o "$tmp" "${RAW_BASE}/systemd/reactive-resume.service"; then
+    if ! curl -fsSL --retry 3 -o "$tmp" "${RAW_BASE}/systemd/reactive-resume.service?v=$(date +%s)"; then
       rm -f "$tmp"
       die "systemd-Unit konnte nicht geladen werden."
     fi

@@ -90,17 +90,36 @@ grep -qx 'nameserver 10.1.2.4' "$TMP/resolv.conf" || fail "sekundärer DNS fehlt
 grep -Fq "set 999 --nameserver 10.1.2.3 10.1.2.4" "$PCT_LOG" \
   || fail "Nameserver wurde nicht in der LXC-Config gesetzt"
 
-# Working DNS without an explicit override: no config churn.
+# Guest gateway is preferred over an unreachable host-only DNS subnet.
 : > "$PCT_LOG"
+rm -f "$TMP/resolv-gw.conf"
 # shellcheck disable=SC2034 # consumed by ensure_guest_dns
-NAMESERVERS="10.1.2.3"
+NAMESERVERS="192.168.178.111 192.168.178.1"
 # shellcheck disable=SC2034 # consumed by ensure_guest_dns
 NAMESERVER_OPT=""
 guest_resolves_dns_retry() { return 0; }
+pct() {
+  printf '%s\n' "$*" >> "$PCT_LOG"
+  if [[ "$1" == "set" ]]; then return 0; fi
+  if [[ "$1" == "exec" ]]; then
+    shift 2
+    [[ "${1:-}" == "--" ]] && shift
+    case "$*" in
+      *"route show default"*) printf 'default via 10.120.1.1 dev eth0\n' ;;
+      *"cat > /etc/resolv.conf"*) cat > "$TMP/resolv-gw.conf" ;;
+      *) return 0 ;;
+    esac
+  fi
+}
 ensure_guest_dns
-[[ ! -s "$PCT_LOG" ]] || fail "ensure_guest_dns hat bei funktionierendem DNS unnötig geschrieben"
+grep -Fq "set 999 --nameserver 10.120.1.1" "$PCT_LOG" \
+  || fail "Gast-Gateway wurde nicht als DNS bevorzugt"
+grep -qx 'nameserver 10.120.1.1' "$TMP/resolv-gw.conf" \
+  || fail "Gast-Gateway fehlt in resolv.conf"
+! grep -q '192.168.178' "$TMP/resolv-gw.conf" \
+  || fail "nicht erreichbarer Host-DNS wurde in den Gast geschrieben"
 
-# Explicit override is applied even when DNS already works.
+# Explicit override still wins and is applied even when DNS currently works.
 guest_resolves_dns_retry() { return 0; }
 # shellcheck disable=SC2034 # consumed by ensure_guest_dns
 NAMESERVERS="10.9.9.9"

@@ -821,12 +821,25 @@ wait_for_vm_ip() {
   wait_vm_ssh
 }
 
-guest_resolves_dns() {
+guest_default_gateway() {
+  local out=""
   if [[ "$MODE" == "lxc" ]]; then
-    pct exec "$VMID" -- getent hosts deb.debian.org >/dev/null 2>&1
+    out="$(pct exec "$VMID" -- ip -4 route show default 2>/dev/null | awk 'NR==1 {print $3}')" || true
   else
-    ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" 'getent hosts deb.debian.org' >/dev/null 2>&1
+    out="$(ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" 'ip -4 route show default' 2>/dev/null | awk 'NR==1 {print $3}')" || true
   fi
+  is_ipv4 "${out:-}" && printf '%s\n' "$out"
+}
+
+guest_resolves_dns() {
+  local name
+  for name in deb.debian.org security.debian.org; do
+    if [[ "$MODE" == "lxc" ]]; then
+      pct exec "$VMID" -- getent hosts "$name" >/dev/null 2>&1 || return 1
+    else
+      ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" "getent hosts ${name}" >/dev/null 2>&1 || return 1
+    fi
+  done
 }
 
 guest_resolves_dns_retry() {
@@ -839,40 +852,75 @@ guest_resolves_dns_retry() {
 }
 
 apply_vm_dns() {
+  local servers="${1:-$NAMESERVERS}" ns
+  local -a ns_list=()
+  read -r -a ns_list <<< "$servers"
   if ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" 'command -v resolvectl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved'; then
-    printf '[Resolve]\nDNS=%s\n' "$NAMESERVERS" \
+    printf '[Resolve]\nDNS=%s\n' "$servers" \
       | ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" \
         'sudo mkdir -p /etc/systemd/resolved.conf.d && sudo tee /etc/systemd/resolved.conf.d/99-reactive-resume.conf >/dev/null && sudo systemctl restart systemd-resolved'
   else
-    printf 'nameserver %s\n' $NAMESERVERS \
+    for ns in "${ns_list[@]}"; do printf 'nameserver %s\n' "$ns"; done \
       | ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" 'sudo tee /etc/resolv.conf >/dev/null'
+  fi
+}
+
+write_guest_dns() {
+  local servers="$1" ns
+  local -a ns_list=()
+  read -r -a ns_list <<< "$servers"
+  if [[ "$MODE" == "lxc" ]]; then
+    for ns in "${ns_list[@]}"; do printf 'nameserver %s\n' "$ns"; done \
+      | pct exec "$VMID" -- sh -c 'cat > /etc/resolv.conf'
+  else
+    apply_vm_dns "$servers"
+  fi
+}
+
+persist_guest_dns() {
+  local servers="$1"
+  if [[ "$MODE" == "lxc" ]]; then
+    pct set "$VMID" --nameserver "$servers" \
+      || msg_warn "Nameserver konnte nicht dauerhaft in der CT-Config gesetzt werden."
+  else
+    qm set "$VMID" --nameserver "$servers" \
+      || msg_warn "Nameserver konnte nicht dauerhaft in der VM-Config gesetzt werden."
   fi
 }
 
 ensure_guest_dns() {
   [[ -n "$NAMESERVERS" ]] || return 0
-  if [[ -z "$NAMESERVER_OPT" ]]; then
-    guest_resolves_dns_retry && return 0
-    msg_warn "DNS-Auflösung im Gast fehlgeschlagen; setze Nameserver: ${NAMESERVERS}"
+  local gw c ns
+  local -a candidates=()
+  if [[ -n "$NAMESERVER_OPT" ]]; then
+    candidates=("$NAMESERVER_OPT")
   else
-    msg_info "Setze DNS explizit: ${NAMESERVERS}"
+    gw="$(guest_default_gateway || true)"
+    [[ -n "$gw" ]] && candidates+=("$gw")
+    candidates+=("$NAMESERVERS")
+    candidates+=("1.1.1.1" "9.9.9.9")
   fi
-  if [[ "$MODE" == "lxc" ]]; then
-    if ! pct set "$VMID" --nameserver "$NAMESERVERS"; then
-      msg_warn "Nameserver konnte nicht dauerhaft in der CT-Config gesetzt werden."
+  for c in "${candidates[@]}"; do
+    local -a valid=()
+    for ns in $c; do
+      is_ipv4 "$ns" && valid+=("$ns")
+    done
+    (( ${#valid[@]} )) || continue
+    c="${valid[*]}"
+    msg_info "Prüfe DNS im Gast: ${c}"
+    if ! write_guest_dns "$c"; then
+      msg_warn "DNS ${c} konnte im Gast nicht geschrieben werden."
+      continue
     fi
-    # shellcheck disable=SC2086 # nameservers are validated IPv4 addresses
-    if ! printf 'nameserver %s\n' $NAMESERVERS | pct exec "$VMID" -- sh -c 'cat > /etc/resolv.conf'; then
-      die "resolv.conf im Container konnte nicht geschrieben werden."
+    if guest_resolves_dns_retry; then
+      NAMESERVERS="$c"
+      persist_guest_dns "$c"
+      msg_ok "DNS im Gast: ${c}"
+      return 0
     fi
-  else
-    if ! qm set "$VMID" --nameserver "$NAMESERVERS"; then
-      msg_warn "Nameserver konnte nicht dauerhaft in der VM-Config gesetzt werden."
-    fi
-    apply_vm_dns || die "DNS-Konfiguration in der VM konnte nicht geschrieben werden."
-  fi
-  guest_resolves_dns_retry || die "DNS-Auflösung im Gast weiterhin fehlgeschlagen (Nameserver: ${NAMESERVERS})."
-  msg_ok "DNS im Gast korrigiert (${NAMESERVERS})."
+    msg_warn "DNS ${c} löst deb.debian.org/security.debian.org nicht auf."
+  done
+  die "Kein funktionierender DNS-Server im Gast gefunden (versucht: ${candidates[*]}). Prüfe Netzwerk/Gateway oder nutze --nameserver."
 }
 
 main() {

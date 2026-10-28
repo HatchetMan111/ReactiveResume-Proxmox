@@ -347,6 +347,8 @@ main() {
   APP_URL="$(normalize_app_url "$APP_URL")"
   msg_info "APP_URL: ${APP_URL}"
   msg_info "APP_IMAGE: ${APP_IMAGE}"
+  # apt's _apt user must be able to read the resolver configuration.
+  chmod 644 /etc/resolv.conf 2>/dev/null || true
   if ! getent hosts deb.debian.org >/dev/null 2>&1; then
     local ns
     ns="$(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | tr '\n' ' ' || true)"

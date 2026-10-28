@@ -892,7 +892,7 @@ apply_vm_dns() {
         'sudo mkdir -p /etc/systemd/resolved.conf.d && sudo tee /etc/systemd/resolved.conf.d/99-reactive-resume.conf >/dev/null && sudo systemctl restart systemd-resolved'
   else
     for ns in "${ns_list[@]}"; do printf 'nameserver %s\n' "$ns"; done \
-      | ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" 'sudo tee /etc/resolv.conf >/dev/null'
+      | ssh "${SSH_OPTS[@]}" "${CI_USER}@${IP}" 'sudo tee /etc/resolv.conf >/dev/null && sudo chmod 644 /etc/resolv.conf'
   fi
 }
 
@@ -902,7 +902,7 @@ write_guest_dns() {
   read -r -a ns_list <<< "$servers"
   if [[ "$MODE" == "lxc" ]]; then
     for ns in "${ns_list[@]}"; do printf 'nameserver %s\n' "$ns"; done \
-      | pct exec "$VMID" -- sh -c 'cat > /etc/resolv.conf'
+      | pct exec "$VMID" -- sh -c 'cat > /etc/resolv.conf && chmod 644 /etc/resolv.conf'
   else
     apply_vm_dns "$servers"
   fi
@@ -927,8 +927,8 @@ ensure_guest_dns() {
     candidates=("$NAMESERVER_OPT")
   else
     gw="$(guest_default_gateway || true)"
-    [[ -n "$gw" ]] && candidates+=("$gw")
     candidates+=("$NAMESERVERS")
+    [[ -n "$gw" ]] && candidates+=("$gw")
     candidates+=("1.1.1.1" "9.9.9.9")
   fi
   for c in "${candidates[@]}"; do
@@ -946,6 +946,11 @@ ensure_guest_dns() {
     if guest_resolves_dns_retry; then
       NAMESERVERS="$c"
       persist_guest_dns "$c"
+      # pct/qm set may rewrite resolv.conf; restore it and verify again.
+      if ! write_guest_dns "$c" || ! guest_resolves_dns_retry; then
+        msg_warn "DNS ${c} ist nach dem Persistieren nicht mehr nutzbar."
+        continue
+      fi
       msg_ok "DNS im Gast: ${c}"
       return 0
     fi

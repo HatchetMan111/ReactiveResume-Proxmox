@@ -90,14 +90,16 @@ grep -qx 'nameserver 10.1.2.4' "$TMP/resolv.conf" || fail "sekundärer DNS fehlt
 grep -Fq "set 999 --nameserver 10.1.2.3 10.1.2.4" "$PCT_LOG" \
   || fail "Nameserver wurde nicht in der LXC-Config gesetzt"
 
-# Guest gateway is preferred over an unreachable host-only DNS subnet.
+# Unreachable host-only DNS is skipped in favour of the guest gateway.
 : > "$PCT_LOG"
 rm -f "$TMP/resolv-gw.conf"
 # shellcheck disable=SC2034 # consumed by ensure_guest_dns
 NAMESERVERS="192.168.178.111 192.168.178.1"
 # shellcheck disable=SC2034 # consumed by ensure_guest_dns
 NAMESERVER_OPT=""
-guest_resolves_dns_retry() { return 0; }
+guest_resolves_dns_retry() {
+  ! grep -q '192.168.178' "$TMP/resolv-gw.conf" 2>/dev/null
+}
 pct() {
   printf '%s\n' "$*" >> "$PCT_LOG"
   if [[ "$1" == "set" ]]; then return 0; fi

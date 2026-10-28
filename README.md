@@ -64,7 +64,7 @@ verlässliche Variante für nicht veröffentlichte Änderungen.
 --image REF          App-Image (Default: amruthpillai/reactive-resume:latest)
 --ip CIDR            statische IP inkl. Präfix
 --gw IP              Gateway (nur mit --ip)
---nameserver "IP..." DNS-Server für den Gast (Default: Gast-Gateway, sonst Host-DNS)
+--nameserver "IP..." DNS-Server für den Gast (Default: Host-DNS, sonst Gast-Gateway)
 --ssh-key PATH       privater SSH-Key (nur VM)
 --force              fremde/existierende ID in-place übernehmen (kein Neuaufbau);
                      VM: verwendeter SSH-Key muss im Gast bereits autorisiert sein
@@ -137,11 +137,11 @@ Prüft Dienst, Compose, Health, Web-UI (`/`) und `APP_URL` vor und nach
 
 ## DNS-Probleme
 
-Der Installer testet den DNS im Gast und bevorzugt dessen Default-Gateway.
-Danach folgen die Nameserver des Proxmox-Hosts (bzw. systemd-resolved-
-Upstreams), dann `1.1.1.1` und `9.9.9.9`. So wird ein Host-DNS aus einem
-anderen, vom Gast nicht erreichbaren Subnetz übersprungen. Kann der Gast
-trotzdem nicht auflösen, lässt sich der DNS explizit setzen:
+Der Installer testet die Kandidaten direkt im Gast: zuerst die Nameserver des
+Proxmox-Hosts (bzw. systemd-resolved-Upstreams), dann das Default-Gateway des
+Gasts, zuletzt `1.1.1.1` und `9.9.9.9`. Ein vom Gast nicht erreichbarer
+Host-DNS wird so übersprungen. Kann der Gast trotzdem nicht auflösen, lässt
+sich der DNS explizit setzen:
 
 ```bash
 bash install/reactive-resume.sh --vmid 109 --nameserver 10.120.1.1

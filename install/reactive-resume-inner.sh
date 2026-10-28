@@ -196,6 +196,10 @@ on_error() {
 
 install_docker() {
   export DEBIAN_FRONTEND=noninteractive
+  # Some LXC templates cannot resolve DNS as the _apt sandbox user.
+  # This also covers apt calls inside Docker's install script.
+  printf 'APT::Sandbox::User "root";\n' > /etc/apt/apt.conf.d/99reactive-resume-no-sandbox
+  chmod 644 /etc/apt/apt.conf.d/99reactive-resume-no-sandbox
   if ! apt-get update -qq || ! apt-get install -y -qq curl ca-certificates openssl >/dev/null; then
     msg_warn "apt als _apt fehlgeschlagen; versuche ohne apt-Sandbox (root)."
     apt-get -o APT::Sandbox::User=root update -qq

@@ -189,8 +189,11 @@ on_error() {
 
 install_docker() {
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq curl ca-certificates openssl >/dev/null
+  if ! apt-get update -qq || ! apt-get install -y -qq curl ca-certificates openssl >/dev/null; then
+    msg_warn "apt als _apt fehlgeschlagen; versuche ohne apt-Sandbox (root)."
+    apt-get -o APT::Sandbox::User=root update -qq
+    apt-get -o APT::Sandbox::User=root install -y -qq curl ca-certificates openssl >/dev/null
+  fi
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     msg_ok "Docker und Compose sind bereits vorhanden."
   else
@@ -353,6 +356,9 @@ main() {
     local ns
     ns="$(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | tr '\n' ' ' || true)"
     die "DNS-Auflösung fehlgeschlagen (Nameserver: ${ns:-unbekannt}). Installer auf dem Host mit --nameserver <DNS> erneut ausführen."
+  fi
+  if ! su -s /bin/sh _apt -c 'getent hosts deb.debian.org' >/dev/null 2>&1; then
+    msg_warn "_apt kann DNS nicht auflösen; apt nutzt ggf. den root-Fallback."
   fi
 
   install_docker
